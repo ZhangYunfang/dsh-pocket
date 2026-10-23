@@ -21,8 +21,8 @@ client/mobile/
 ## 同步步骤（上游发新版后）
 
 ```powershell
-node C:\Users\daha\.dsh\dsh-pocket\sync-dsh-web-mobile.mjs          # 跟 origin/main
-node C:\Users\daha\.dsh\dsh-pocket\sync-dsh-web-mobile.mjs v2.4.0   # 或指定 tag
+node %USERPROFILE%\.dsh\dsh-pocket\sync-dsh-web-mobile.mjs          # 跟 origin/main
+node %USERPROFILE%\.dsh\dsh-pocket\sync-dsh-web-mobile.mjs v2.4.0   # 或指定 tag
 ```
 
 脚本会：fetch → 镜像 src/client → **镜像期变换（见下）** → esbuild 重建 client.js →
@@ -42,12 +42,12 @@ node --check。产物 `client/client.js` 由 esbuild 打包 upstream/ + 适配�
    变换后脚本断言镜像目录零 `dshWebMobileNav` 残留——**上游新增未跟踪文件**（如
    v3.1.0 的 file-share-locale.ts）git grep 搜不到，断言必须走文件系统遍历。
 
-构建依赖 esbuild：vendored 于 `C:\Users\daha\.dsh\dsh-pocket\vendor\node_modules\`
+构建依赖 esbuild：vendored 于 `%USERPROFILE%\.dsh\dsh-pocket\vendor\node_modules\`
 （esbuild@0.28.1 + @esbuild/win32-x64），sync 脚本自动 junction 进包内 node_modules。
 `dsh plugin update dsh-pocket` 重装包后 junction 会丢——重跑 sync 脚本即可恢复。
 
 **同步后必做：**
-1. 重启 dsh web（`node C:\Users\daha\.dsh\dsh-pocket\detached-restart.cjs`，注意会断当前会话）。
+1. 重启 dsh web（`node %USERPROFILE%\.dsh\dsh-pocket\detached-restart.cjs`，注意会断当前会话）。
    combo URL 的 rev 启动时重分配，无缓存问题。
 2. WebKit（JSC/同 iPhone 引擎）回归：登录 PIN → 开历史会话（对话渲染）→ 抽屉开合 → 左缘右滑。
 3. **对表 inject 硬依赖**：upstream/index.tsx 的 `export const inject` 若增删服务名，
