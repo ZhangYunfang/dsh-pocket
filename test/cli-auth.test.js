@@ -10,6 +10,8 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
@@ -17,6 +19,7 @@ import {
   resolvePin,
   buildAuth,
   entryUrl,
+  resolvePublicConfig,
   MIN_PIN_LENGTH,
 } from '../bin/dsh-pocket.mjs';
 
@@ -96,6 +99,36 @@ test('issue #90：密码要内嵌进入口 URL —— 加了认证不能让扫�
   assert.equal(entryUrl('http://1.2.3.4:3081', 'a b&c=d'), 'http://1.2.3.4:3081/?token=a+b%26c%3Dd');
   // 无密码时原样返回
   assert.equal(entryUrl('http://192.168.1.20:3081', null), 'http://192.168.1.20:3081');
+});
+
+test('CLI 公网只接受已配置的固定域名，入口 URL 不依赖隧道输出', () => {
+  const token = 'example-token-for-offline-tests';
+  for (const config of [{ hostname: '', token }, { hostname: 'pocket.example.com', token: '' }]) {
+    assert.throws(() => resolvePublicConfig(config), /固定域名.*Tunnel Token/);
+  }
+  const config = resolvePublicConfig({ hostname: 'pocket.example.com', token });
+  assert.equal(config.url, 'https://pocket.example.com');
+  assert.equal(entryUrl(config.url, '12345678'), 'https://pocket.example.com/?token=12345678');
+  const src = readFileSync(cliPath, 'utf8');
+  assert.ok(src.includes('entryUrl(publicConfig.url, pin)'));
+  assert.ok(!src.includes('startQuickTunnel'));
+});
+
+test('CLI --public 未配置时在监听端口或下载隧道程序前退出', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-pocket-cli-config-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await assert.rejects(
+    execFileAsync(process.execPath, [cliPath, '--public'], {
+      env: { ...process.env, DSH_HOME: home, DSH_POCKET_PIN: '', DSH_POCKET_CLOUDFLARED: join(home, 'must-not-run') },
+      timeout: 10000,
+    }),
+    (err) => {
+      assert.equal(err.code, 1);
+      assert.match(String(err.stderr), /固定域名.*Tunnel Token/);
+      assert.ok(!String(err.stdout).includes('启动中'));
+      return true;
+    },
+  );
 });
 
 test('issue #90：为可测性加的 isDirectRun 守卫不能把 CLI 变成哑巴', async () => {

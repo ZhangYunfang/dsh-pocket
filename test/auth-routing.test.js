@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { tokenForHost, credentialKindForHost, isLanOverrideHost, rotateAccessToken } from '../lib/index.js';
@@ -80,16 +80,15 @@ test('issue #90：访问 PIN 必须用 CSPRNG 生成，不得回退到 Math.rand
   assert.ok(seen.size >= 199, `200 次采样应基本互不相同，实际 ${seen.size} 个不同值`);
 }));
 
-test('登录页凭据语义：LAN、Named 和自定义公网 PIN 可保存，Quick 自动 PIN 不保存', () => withTempHome(async () => {
+test('登录页凭据语义：LAN、Named 和自定义公网 PIN 均可保存', () => withTempHome(async () => {
   setLanIpOverride('');
-  setTunnelMode('quick');
   setPinCustom('public', false);
 
   assert.equal(credentialKindForHost('192.168.1.5:3081'), 'persistent', 'LAN 自动 PIN 持久到手动刷新');
-  assert.equal(credentialKindForHost('abc.trycloudflare.com'), 'ephemeral', 'Quick 自动 PIN 每次开隧道轮换');
+  assert.equal(credentialKindForHost('pocket.example.com'), 'persistent', '未配置公网时凭据也不标记为临时');
 
   setPinCustom('public', true);
-  assert.equal(credentialKindForHost('abc.trycloudflare.com'), 'persistent', 'Quick 自定义 PIN 长期复用');
+  assert.equal(credentialKindForHost('pocket.example.com'), 'persistent', '自定义公网 PIN 长期复用');
 
   setPinCustom('public', false);
   setTunnelMode('named');
@@ -98,3 +97,17 @@ test('登录页凭据语义：LAN、Named 和自定义公网 PIN 可保存，Qui
   setLanIpOverride('203.0.113.5');
   assert.equal(credentialKindForHost('203.0.113.5:3081'), 'persistent', '手动 LAN 地址覆盖仍按 LAN 持久 PIN 处理');
 }));
+
+for (const custom of [false, true]) {
+  test(`登录页凭据语义：旧 quick 配置的公网 PIN 仍持久（自定义=${custom}）`, () => withTempHome(async () => {
+    const dir = join(tmpHome, 'dsh-pocket');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, 'settings.json');
+    const legacy = JSON.stringify({ tunnelMode: 'quick', publicPinCustom: custom });
+    writeFileSync(file, legacy);
+    for (const host of ['pocket.example.com', '192.168.1.5:3081', '100.64.0.1:3081', '127.0.0.1:3081']) {
+      assert.equal(credentialKindForHost(host), 'persistent', '旧模式不再产生临时凭据');
+    }
+    assert.equal(readFileSync(file, 'utf8'), legacy, '凭据分类不改写旧配置');
+  }));
+}

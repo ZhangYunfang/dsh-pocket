@@ -8,7 +8,7 @@
 //   - 单列三区：连接（局域网/公网两个通道小节）→ 偏好 → 尾部（恢复出厂 + 署名行）；
 //   - 二维码横排卡：左 128px 码 + 右地址/提示/复制，不再整宽堆叠；
 //   - 访问密码默认遮罩（••••••••，不泄露长度），「显示」按需明文；
-//   - 分段控件（公网地址模式）、统一样式的确认弹窗与 Alert 提示条。
+//   - 自配公网表单、统一样式的确认弹窗与 Alert 提示条。
 //
 // 注：Web Push 已移除——浏览器推送依赖 Google FCM（Chrome）等境外服务，
 // 国内直连被墙，普通用户用不了。专注扫码同屏这一件事。
@@ -213,9 +213,6 @@ body[data-ds-dark-theme] .dshp-page{--dshp-line:rgba(255,255,255,.11);--dshp-lin
 .dshp-input,.dshp-select{font:inherit;height:32px;padding:0 10px;border-radius:8px;border:1px solid var(--dshp-line-2);background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dshp-text);font-size:12.5px;outline:none;min-width:0;box-sizing:border-box}
 .dshp-input:focus,.dshp-select:focus{border-color:color-mix(in srgb,var(--dshp-brand) 45%,transparent);box-shadow:0 0 0 3px color-mix(in srgb,var(--dshp-brand) 12%,transparent)}
 .dshp-input.is-mono{font-family:ui-monospace,Menlo,monospace;letter-spacing:.5px}
-.dshp-seg{display:inline-flex;gap:2px;padding:3px;border-radius:9px;background:var(--dshp-fill)}
-.dshp-seg-btn{font:inherit;cursor:pointer;border:0;height:26px;padding:0 12px;border-radius:7px;font-size:12px;background:transparent;color:var(--dshp-text-3);transition:background .12s ease,color .12s ease}
-.dshp-seg-btn.is-active{background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dshp-text);font-weight:600;box-shadow:0 1px 3px rgba(15,17,21,.12)}
 .dshp-pinbox{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--dshp-fill);border:1px solid var(--dshp-line);border-radius:10px;padding:8px 10px}
 .dshp-pin-value{font-family:ui-monospace,Menlo,monospace;font-size:13.5px;letter-spacing:2px;color:var(--dshp-text);flex:1;min-width:96px;word-break:break-all}
 .dshp-pinbox .dshp-btn{flex:none}
@@ -480,8 +477,8 @@ function PocketSettingsTab({ rpcCall, t }) {
   const doStartTunnel = async () => {
     // 命名隧道模式：Token/域名没配齐就不发起（服务端同样会拒绝）
     const cfg = status?.tunnelConfig;
-    if (cfg?.mode === 'named' && (!cfg.hostname || !cfg.tokenSet)) {
-      setError(t('namedNeedCfg'));
+    if (!cfg?.hostname || !cfg?.tokenSet) {
+      setTunnelCfg({ hostname: cfg?.hostname ?? '', token: '', err: t('namedNeedCfg') });
       return;
     }
     setError(null);
@@ -499,7 +496,11 @@ function PocketSettingsTab({ rpcCall, t }) {
     });
   };
   const startTunnel = () => {
-    // 每次开启都弹免责确认（勾选后才能继续）
+    const cfg = status?.tunnelConfig;
+    if (!cfg?.hostname || !cfg?.tokenSet) {
+      setTunnelCfg({ hostname: cfg?.hostname ?? '', token: '', err: null });
+      return;
+    }
     setDisclaimerChecked(false);
     setDisclaimerOpen(true);
   };
@@ -519,18 +520,8 @@ function PocketSettingsTab({ rpcCall, t }) {
     }
   });
 
-  // 公网模式（issue #66）：随机域名（默认零配置）/ 固定域名（Cloudflare 命名隧道 + Tunnel Token）
-  // tunnelCfg：编辑态 { hostname, token, err } | null；token 输入留空 = 保持已存的 Token 不变
+  // Token 输入留空时保留已有凭据；配置保存不自动开启公网。
   const [tunnelCfg, setTunnelCfg] = useState(null);
-  const switchToQuick = () => withPending('tunnelCfg', async () => {
-    try {
-      const s = await call(POCKET_ENDPOINTS.tunnelSetConfig, { mode: 'quick' });
-      setStatus(s);
-      setTunnelState(s.tunnelState ?? null);
-    } catch (err) {
-      setError(err.message);
-    }
-  });
   const saveNamedTunnel = () => withPending('saveNamed', async () => {
     try {
       const s = await call(POCKET_ENDPOINTS.tunnelSetConfig, {
@@ -651,7 +642,7 @@ function PocketSettingsTab({ rpcCall, t }) {
     }
   });
 
-  // 自定义访问密码（issue #33）：公网/局域网各自设固定 8–64 位密码（英文字母大小写或数字）；自定义后公网不再自动轮换。
+  // 自定义访问密码：公网/局域网各自设固定 8–64 位密码（英文字母大小写或数字）。
   // customPin: { which: 'public'|'lan', value, err } | null —— 正在输入自定义密码的区块
   const [customPin, setCustomPin] = useState(null);
   const saveCustomPin = (which) => withPending('savePin', async () => {
@@ -681,11 +672,10 @@ function PocketSettingsTab({ rpcCall, t }) {
   const tunnelStarting = ['downloading', 'starting', 'registering'].includes(tunnelPhase);
   const tunnelStateDetail = tunnelState?.detail ?? '';
   const tunnelStateStarted = tunnelState?.startedAt ?? null;
-  // 公网模式视图（issue #66）：{ mode, hostname, tokenSet }
-  const tunnelModeView = status?.tunnelConfig ?? { mode: 'quick', hostname: '', tokenSet: false };
-  const namedMode = tunnelModeView.mode === 'named';
-  // 模式按钮选中态高亮：固定域名模式本身，或正在编辑固定域名配置，都视为「选中」
-  const namedActive = namedMode || tunnelCfg !== null;
+  const tunnelConfig = status?.tunnelConfig ?? { hostname: '', tokenSet: false };
+  const publicConfigured = Boolean(tunnelConfig.hostname && tunnelConfig.tokenSet);
+  const openTunnelConfig = () => setTunnelCfg({ hostname: tunnelConfig.hostname ?? '', token: '', err: null });
+  const tunnelConfigChanged = Boolean(tunnelUrl && tunnelUrl !== `https://${tunnelConfig.hostname}`);
   // 后端错误消息统一为「中文 | English」混排；按当前界面语言只显示对应一半
   const errText = (msg) => {
     const s = String(msg ?? '');
@@ -819,17 +809,6 @@ function PocketSettingsTab({ rpcCall, t }) {
 
   const customBtn = (which) => Btn({ variant: 'ghost', mini: true, onClick: () => setCustomPin({ which, value: '', err: null }) }, t('customize'));
 
-  // 公网地址模式分段控件（随机/固定域名）
-  const modeSeg = h('div', { className: 'dshp-seg' },
-    h('button', {
-      type: 'button', className: `dshp-seg-btn${!namedActive ? ' is-active' : ''}`,
-      onClick: namedMode ? switchToQuick : (tunnelCfg ? () => setTunnelCfg(null) : undefined),
-    }, t('modeQuick')),
-    h('button', {
-      type: 'button', className: `dshp-seg-btn${namedActive ? ' is-active' : ''}`,
-      onClick: () => setTunnelCfg(tunnelCfg ? null : { hostname: tunnelModeView.hostname ?? '', token: '', err: null }),
-    }, t('modeNamed')));
-
   // 统一确认弹窗：遮罩 + 面板（标题色随语义）+ 内容 + 右对齐操作
   // 可访问性：role=dialog + aria-modal + aria-label；Esc 关闭（见下面的全局 keydown effect）；
   // 点遮罩空白处关闭。取消按钮带 autoFocus，键盘用户打开即可直接 Esc/Enter。
@@ -855,24 +834,24 @@ function PocketSettingsTab({ rpcCall, t }) {
     })
     : tunnelPhase === 'error'
       ? Alert({ kind: 'error', icon: Ico.warn, children: fmt(t, 'error', { detail: errText(tunnelStateDetail) || t('unknownError') }) })
-      : (!tunnelUrl && !isDesktop
+      : (!tunnelUrl && publicConfigured
         ? Alert({
           kind: 'info', icon: Ico.info, children: t('wanOffHint'),
           extra: h('div', { style: { marginTop: 8 } },
-            Btn({ variant: 'primary', onClick: startTunnel, disabled: pending.wan === true }, t('enable'))),
+            Btn({ variant: 'primary', onClick: startTunnel, disabled: pending.wan === true || pending.saveNamed === true }, t('enable'))),
         })
         : null);
 
-  const namedSummaryView = namedMode && !tunnelCfg
+  const namedSummaryView = publicConfigured && !tunnelCfg
     ? h('div', { className: 'dshp-panel' },
       h('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 10 } },
         h('div', { style: { flex: 1, minWidth: 0 } },
-          h('div', { className: 'dshp-panel-title' }, tunnelModeView.hostname || '—'),
+          h('div', { className: 'dshp-panel-title' }, tunnelConfig.hostname || '—'),
           h('div', { className: 'dshp-hint', style: { marginTop: 2 } },
-            tunnelModeView.tokenSet ? t('namedTokenSet') : t('namedTokenMissing'))),
-        Btn({ variant: 'ghost', mini: true, onClick: () => setTunnelCfg({ hostname: tunnelModeView.hostname ?? '', token: '', err: null }) }, t('namedEdit'))),
+            tunnelConfig.tokenSet ? t('namedTokenSet') : t('namedTokenMissing'))),
+        Btn({ variant: 'ghost', mini: true, onClick: () => setTunnelCfg({ hostname: tunnelConfig.hostname ?? '', token: '', err: null }) }, t('namedEdit'))),
       h('div', { className: 'dshp-hint', style: { marginTop: 8, lineHeight: 1.65 } }, t('namedHow')),
-      !tunnelModeView.tokenSet || !tunnelModeView.hostname ? h('div', { className: 'dshp-err-text' }, t('namedNeedCfg')) : null)
+      !tunnelConfig.tokenSet || !tunnelConfig.hostname ? h('div', { className: 'dshp-err-text' }, t('namedNeedCfg')) : null)
     : null;
 
   const namedFormView = tunnelCfg
@@ -902,8 +881,13 @@ function PocketSettingsTab({ rpcCall, t }) {
       tunnelCfg.err ? h('div', { className: 'dshp-err-text' }, errText(tunnelCfg.err)) : null)
     : null;
 
-  const modeExtra = h('div', { className: 'dshp-adv' },
-    namedMode && /trycloudflare\.com/i.test(tunnelUrl ?? '') ? h('div', { className: 'dshp-warn-text' }, t('namedTakeEffect')) : null,
+  const publicConfigView = h('div', { className: 'dshp-adv' },
+    tunnelConfigChanged ? h('div', { className: 'dshp-warn-text' }, t('namedTakeEffect')) : null,
+    !publicConfigured && !tunnelCfg ? Alert({
+      kind: 'info', icon: Ico.info, children: t('publicSetupHint'),
+      extra: h('div', { style: { marginTop: 8 } },
+        Btn({ variant: 'primary', onClick: openTunnelConfig }, t('publicConfigure'))),
+    }) : null,
     namedSummaryView,
     namedFormView);
 
@@ -915,18 +899,14 @@ function PocketSettingsTab({ rpcCall, t }) {
         ? customPinRow('public')
         : h('div', null,
           pinValueRow('public', status.accessToken, [customBtn('public')]),
-          !namedMode && status?.publicPinCustom ? h('div', { className: 'dshp-hint' }, t('pinCustomHint')) : null,
-          namedMode ? h('div', { className: 'dshp-warn-text' }, t('namedSecurity')) : null),
+          h('div', { className: 'dshp-warn-text' }, t('namedSecurity'))),
     })
     : null;
 
-  const wanBody = tunnelUrl
-    ? h('div', null,
-      QRBlock({ src: status.tunnelQr, url: tunnelUrl, hint: namedMode ? t('namedRunningHint') : null }),
-      !namedMode ? Alert({ kind: 'warn', icon: Ico.warn, children: t('wanEphemeralWarn') }) : null,
-      Row({ label: t('modeLabel'), control: modeSeg, stack: true, extra: modeExtra }),
-      publicPinView)
-    : null;
+  const wanBody = h('div', null,
+    tunnelUrl ? QRBlock({ src: status.tunnelQr, url: tunnelUrl, hint: t('namedRunningHint') }) : null,
+    Row({ label: t('publicConfig'), stack: true, extra: publicConfigView }),
+    publicConfigured || tunnelUrl ? publicPinView : null);
 
   return h('div', { className: 'dshp-page', 'data-dshp-ui': 'v3' },
     // 页头：图标 + 标题 + 副题；下面一行状态胶囊汇总两条通道
@@ -1045,8 +1025,8 @@ function PocketSettingsTab({ rpcCall, t }) {
     // ── 公网 ────────────────────────────────────────────────────────────────
     // 卡片：标题 + 副题 + 总开关（开=已连隧道）；开启经免责声明弹窗确认
     Card({
-      key: 'wan', icon: Ico.wan, title: t('wanAccess'), sub: namedMode ? t('namedWanHint') : t('wanHint'),
-      right: Switch(!!tunnelUrl, () => (tunnelUrl ? stopTunnel() : startTunnel()), tunnelStarting || pending.wan === true || !status, t('wanAccess')),
+      key: 'wan', icon: Ico.wan, title: t('wanAccess'), sub: t('namedWanHint'),
+      right: Switch(!!tunnelUrl, () => (tunnelUrl ? stopTunnel() : startTunnel()), tunnelStarting || pending.wan === true || pending.saveNamed === true || !status, t('wanAccess')),
       children: !status
         ? h('div', { className: 'dshp-loading' }, t('loadingStatus'))
         : h('div', null, wanStatusView, wanBody),

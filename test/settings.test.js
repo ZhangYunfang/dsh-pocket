@@ -1,7 +1,7 @@
 // 局域网访问密码开关（issue #24）：默认开启、持久化、可关可开
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -129,19 +129,43 @@ test('setCustomPin / rotateAccessToken（issue #33）：8–64 位字母数字�
 
 // ---------- 命名隧道配置（issue #66：固定公网域名） ----------
 
-test('隧道模式（issue #66）：默认 quick，可切 named/quick，非法值拒绝', () => withHome(async () => {
-  const { tunnelMode, setTunnelMode } = await import('../lib/settings.mjs');
-  assert.equal(tunnelMode(), 'quick', '默认快速隧道');
-  assert.equal(setTunnelMode('named'), 'named', '切换命名隧道');
+test('隧道模式：默认 named 且未配置，拒绝 quick 和非法模式', () => withHome(async () => {
+  const { tunnelMode, tunnelAutoRestoreEnabled, setTunnelMode, tunnelToken, tunnelHostname, settingsPath } = await import('../lib/settings.mjs');
+  assert.equal(tunnelMode(), 'named', '仅保留用户自配命名隧道');
+  assert.equal(tunnelToken(), '', '默认未配置 Token');
+  assert.equal(tunnelHostname(), '', '默认未配置域名');
+  assert.equal(tunnelAutoRestoreEnabled(), false, '无存盘模式不能恢复旧标记');
+  assert.equal(existsSync(settingsPath()), false, '读取默认值不创建配置');
+  assert.throws(() => setTunnelMode('quick'), /named/, 'quick 模式拒绝');
+  assert.equal(existsSync(settingsPath()), false, '拒绝 quick 不落盘');
+  assert.equal(setTunnelMode('named'), 'named', '可显式保存命名模式');
   assert.equal(tunnelMode(), 'named', '命名模式持久化');
-  assert.equal(setTunnelMode('quick'), 'quick', '切回快速隧道');
-  assert.equal(tunnelMode(), 'quick', '快速模式持久化');
-  assert.throws(() => setTunnelMode('other'), /quick 或 named/, '非法模式拒绝');
+  assert.equal(tunnelAutoRestoreEnabled(), true, '显式保存 named 才能沿用旧恢复意图');
+  const before = readFileSync(settingsPath(), 'utf8');
+  for (const mode of ['quick', 'other', undefined, null]) {
+    assert.throws(() => setTunnelMode(mode), /named/, '非法模式拒绝');
+    assert.equal(readFileSync(settingsPath(), 'utf8'), before, '拒绝模式时配置不变');
+  }
 }));
+
+for (const mode of [undefined, 'quick', 'other', 'named']) {
+  test(`隧道模式：旧存盘模式 ${String(mode)} 仅 named 允许沿用自动恢复`, () => withHome(async (home) => {
+    const { tunnelMode, tunnelAutoRestoreEnabled, tunnelToken, tunnelHostname, settingsPath } = await import('../lib/settings.mjs');
+    mkdirSync(join(home, 'dsh-pocket'), { recursive: true });
+    const legacy = { tunnelMode: mode, tunnelToken: 'fake-cloudflared-token-for-tests', tunnelHostname: 'pocket.example.com' };
+    writeFileSync(settingsPath(), JSON.stringify(legacy));
+    const before = readFileSync(settingsPath(), 'utf8');
+    assert.equal(tunnelMode(), 'named', '旧模式对外统一为 named');
+    assert.equal(tunnelAutoRestoreEnabled(), mode === 'named', '恢复资格取决于原存盘模式');
+    assert.equal(tunnelToken(), legacy.tunnelToken, '读取保留旧 Token');
+    assert.equal(tunnelHostname(), legacy.tunnelHostname, '读取保留旧域名');
+    assert.equal(readFileSync(settingsPath(), 'utf8'), before, '读取不会悄悄改写旧配置');
+  }));
+}
 
 test('Tunnel Token（issue #66）：设置/清除持久化；过短/非法字符拒绝', () => withHome(async () => {
   const { tunnelToken, setTunnelToken, settingsPath } = await import('../lib/settings.mjs');
-  const tok = 'eyJhIjoiY2xvdWRmbGFyZS10b2tlbi1leGFtcGxlLXZhbHVlIn0';
+  const tok = 'fake-cloudflared-token-for-tests';
   assert.equal(tunnelToken(), '', '默认未配置');
   assert.equal(setTunnelToken(tok), tok, '设置成功');
   assert.equal(tunnelToken(), tok, '持久化生效');
@@ -159,7 +183,7 @@ test('固定域名（issue #66）：URL 粘贴归一化、设置/清除持久化
   // 粘贴完整 URL → 归一化为裸域名
   assert.equal(setTunnelHostname('https://Pocket.Example.com/'), 'pocket.example.com', 'URL 归一化（含大小写）');
   assert.equal(tunnelHostname(), 'pocket.example.com', '持久化生效');
-  assert.equal(setTunnelHostname(' sub.other.org:443 '), 'sub.other.org', '带端口/空白归一化');
+  assert.equal(setTunnelHostname(' sub.example.com:443 '), 'sub.example.com', '带端口/空白归一化');
   assert.throws(() => setTunnelHostname('localhost'), /域名/, '无点主机名拒绝（那是局域网域）');
   assert.throws(() => setTunnelHostname('192.168.1.5'), /域名/, '裸 IP 拒绝');
   assert.throws(() => setTunnelHostname('bad host name'), /域名/, '含空格拒绝');
@@ -167,19 +191,80 @@ test('固定域名（issue #66）：URL 粘贴归一化、设置/清除持久化
   assert.equal(tunnelHostname(), '', '清除生效');
 }));
 
+test('Named 配置：一次保存完整配置，归一化域名，未传 Token 保留已有值', () => withHome(async () => {
+  const { setNamedTunnelConfig, tunnelMode, tunnelAutoRestoreEnabled, tunnelToken, tunnelHostname, setLanEnabled, lanEnabled, settingsPath } = await import('../lib/settings.mjs');
+  const token = 'fake-cloudflared-token-for-tests';
+  setLanEnabled(false);
+  assert.deepEqual(setNamedTunnelConfig({ token: ` ${token} `, hostname: 'https://Pocket.Example.com/' }), {
+    mode: 'named', hostname: 'pocket.example.com', tokenSet: true,
+  }, '保存结果不回显 Token');
+  assert.equal(tunnelMode(), 'named');
+  assert.equal(tunnelAutoRestoreEnabled(), true, '完整配置允许自动恢复');
+  assert.equal(tunnelToken(), token);
+  assert.equal(tunnelHostname(), 'pocket.example.com');
+  assert.equal(lanEnabled(), false, '保留其他设置');
+  assert.deepEqual(JSON.parse(readFileSync(settingsPath(), 'utf8')), {
+    lanEnabled: false, tunnelMode: 'named', tunnelHostname: 'pocket.example.com', tunnelToken: token,
+  }, '完整配置一起落盘');
+  if (process.platform !== 'win32') assert.equal(statSync(settingsPath()).mode & 0o777, 0o600, 'Token 文件权限 0600');
+
+  assert.deepEqual(setNamedTunnelConfig({ mode: 'named', hostname: 'other.example.com' }), {
+    mode: 'named', hostname: 'other.example.com', tokenSet: true,
+  });
+  assert.equal(tunnelToken(), token, '未传 Token 时保留现有值');
+  assert.equal(tunnelHostname(), 'other.example.com', '域名更新生效');
+  assert.equal(JSON.parse(readFileSync(settingsPath(), 'utf8')).tunnelToken, token, '保留的 Token 同步落盘');
+}));
+
+test('Named 配置：首次保存缺 Token 或域名时拒绝，且不创建半份配置', () => withHome(async () => {
+  const { setNamedTunnelConfig, tunnelToken, tunnelHostname, tunnelAutoRestoreEnabled, settingsPath } = await import('../lib/settings.mjs');
+  for (const cfg of [{}, { hostname: 'pocket.example.com' }, { token: 'fake-cloudflared-token-for-tests' }, { token: '', hostname: 'pocket.example.com' }, { token: 'fake-cloudflared-token-for-tests', hostname: '' }]) {
+    assert.throws(() => setNamedTunnelConfig(cfg), /固定域名.*Tunnel Token/, '缺任一必填项均拒绝');
+    assert.equal(existsSync(settingsPath()), false, '失败时不创建配置文件');
+    assert.equal(tunnelToken(), '', '不保留半份 Token');
+    assert.equal(tunnelHostname(), '', '不保留半份域名');
+    assert.equal(tunnelAutoRestoreEnabled(), false, '失败时不会开启旧标记恢复');
+  }
+}));
+
+test('Named 配置：校验失败原子保留现有模式、Token、域名及其他设置', () => withHome(async () => {
+  const { setNamedTunnelConfig, tunnelMode, tunnelToken, tunnelHostname, setLanEnabled, settingsPath } = await import('../lib/settings.mjs');
+  const token = 'fake-cloudflared-token-for-tests';
+  const replacement = 'fake-replacement-token-for-tests';
+  setNamedTunnelConfig({ token, hostname: 'pocket.example.com' });
+  setLanEnabled(false);
+  const before = readFileSync(settingsPath(), 'utf8');
+  const invalid = [
+    { mode: 'quick', token: replacement, hostname: 'other.example.com' },
+    { mode: 'other', token: replacement, hostname: 'other.example.com' },
+    { token: replacement, hostname: 'localhost' },
+    { token: replacement, hostname: '192.168.1.5' },
+    { token: replacement, hostname: 'bad host name' },
+    { token: 'short', hostname: 'other.example.com' },
+    { token: 'invalid token with whitespace', hostname: 'other.example.com' },
+    { token: '', hostname: 'other.example.com' },
+    { token: replacement, hostname: '' },
+  ];
+  for (const cfg of invalid) {
+    assert.throws(() => setNamedTunnelConfig(cfg), (err) => err instanceof Error);
+    assert.equal(readFileSync(settingsPath(), 'utf8'), before, '失败时存盘内容逐字节不变');
+    assert.equal(tunnelMode(), 'named', '模式不变');
+    assert.equal(tunnelToken(), token, '内存缓存与存盘 Token 均不变');
+    assert.equal(tunnelHostname(), 'pocket.example.com', '内存缓存与存盘域名均不变');
+  }
+}));
+
 // ---------- 恢复出厂设置 ----------
 
 test('恢复出厂设置：清空全部设置 + 重设随机密码（开关回到默认）', () => withHome(async () => {
   const settings = await import('../lib/settings.mjs');
   const { setCustomPin, getAccessToken, resetPocketState } = await import('../lib/index.js');
-  // 先把设置搞成非默认：关掉开关、切命名隧道、填 Token/域名、自定义密码
+  // 先把设置搞成非默认：关掉开关、配置命名隧道、自定义密码
   settings.setLanEnabled(false);
   settings.setLanAuthEnabled(false);
   settings.setMobileRightbarEnabled(true);
   settings.setLanIpOverride('10.0.0.7');
-  settings.setTunnelMode('named');
-  settings.setTunnelToken('eyJhIjoiY2xvdWRmbGFyZS10b2tlbi1leGFtcGxlLXZhbHVlIn0');
-  settings.setTunnelHostname('pocket.example.com');
+  settings.setNamedTunnelConfig({ token: 'fake-cloudflared-token-for-tests', hostname: 'pocket.example.com' });
   const customPublic = setCustomPin('public', 'aB3xY9k2');
   const customLan = setCustomPin('lan', '77775555');
   assert.equal(existsSync(settings.settingsPath()), true, '设置文件已写入');
@@ -195,7 +280,8 @@ test('恢复出厂设置：清空全部设置 + 重设随机密码（开关回�
   assert.equal(settings.lanAuthEnabled(), true, '访问密码恢复默认开');
   assert.equal(settings.mobileRightbarEnabled(), true, '手机端右边栏恢复默认开');
   assert.equal(settings.lanIpOverride(), '', '局域网地址恢复自动');
-  assert.equal(settings.tunnelMode(), 'quick', '公网模式恢复随机域名');
+  assert.equal(settings.tunnelMode(), 'named', '重置后仍仅支持用户自配 Named');
+  assert.equal(settings.tunnelAutoRestoreEnabled(), false, '重置后不能沿用旧自动恢复标记');
   assert.equal(settings.tunnelToken(), '', 'Tunnel Token 已清空');
   assert.equal(settings.tunnelHostname(), '', '固定域名已清空');
   assert.equal(settings.pinCustom('public'), false, '公网自定义标记已清除');

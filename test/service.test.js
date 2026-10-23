@@ -7,7 +7,7 @@ import { createPocketService, selectLanIPv4 } from '../lib/service.mjs';
 import { installPocketRpc } from '../lib/web-rpc.js';
 import { POCKET_RPC_CHANNEL, POCKET_ENDPOINTS } from '../client/api.js';
 import { isValidIpv4 } from '../lib/ip.mjs';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -22,9 +22,14 @@ function fakeCtxConnection() {
   return { rpc: { handle }, get handler() { return handler; } };
 }
 
+const FAKE_TUNNEL_TOKEN = 'fake-cloudflared-token-for-tests';
+
+function namedTunnelConfig(overrides = {}) {
+  return { mode: 'named', token: FAKE_TUNNEL_TOKEN, hostname: 'pocket.example.com', ...overrides };
+}
+
 function stubInternals() {
   const started = [];
-  let tunnelUrl = null;
   return {
     started,
     lanIPv4: () => '192.168.1.50',
@@ -34,13 +39,24 @@ function stubInternals() {
       port,
       close: async () => { started.push('closed'); },
     }),
-    startTunnel: async ({ port }) => {
-      started.push(`tunnel:${port}`);
-      tunnelUrl = 'https://abc-123.trycloudflare.com';
-      return tunnelUrl;
+    startNamedTunnel: async ({ token }) => {
+      started.push(`named:${token}`);
+      return { url: null, kill: () => {} };
     },
-    get tunnelUrl() { return tunnelUrl; },
   };
+}
+
+async function withHome(fn) {
+  const home = mkdtempSync(join(tmpdir(), 'dshp-service-'));
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    return await fn(home);
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  }
 }
 
 /** 构造 networkInterfaces() 形状的最小接口表。 */
@@ -161,7 +177,7 @@ test('service：lanIpOverride 优先于自动选择，status 返回候选地址'
 
 test('service：startProxy → 局域网状态（含二维码）；startTunnel → 公网状态', async () => {
   const internals = stubInternals();
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
 
   const before = await service.status();
   assert.equal(before.proxyRunning, false);
@@ -174,11 +190,14 @@ test('service：startProxy → 局域网状态（含二维码）；startTunnel �
   assert.equal(lan.tunnelRunning, false);
 
   const url = await service.startTunnel();
-  assert.equal(url, 'https://abc-123.trycloudflare.com');
+  assert.equal(url, 'https://pocket.example.com');
   const pub = await service.status();
   assert.equal(pub.tunnelRunning, true);
-  assert.equal(pub.tunnelQr, 'data:qr;https://abc-123.trycloudflare.com');
-  assert.deepEqual(internals.started, ['tunnel:3081'], '隧道指向代理端口');
+  assert.equal(pub.tunnelQr, 'data:qr;https://pocket.example.com');
+  assert.deepEqual(internals.started, [`named:${FAKE_TUNNEL_TOKEN}`], 'Named 隧道使用已配置 Token');
+  assert.equal(pub.proxyPort, 3081, '局域网代理端口保持不变');
+  assert.equal(pub.tunnelUrl, 'https://pocket.example.com', '公网 URL 使用已配置域名');
+  assert.deepEqual(pub.tunnelConfig, { mode: 'named', hostname: 'pocket.example.com', tokenSet: true }, '状态仅返回脱敏配置');
 
   service.stopTunnel();
   const stopped = await service.status();
@@ -188,9 +207,181 @@ test('service：startProxy → 局域网状态（含二维码）；startTunnel �
   await service.dispose();
 });
 
+for (const [label, cfg] of [
+  ['默认无配置', undefined],
+  ['配置返回 null', null],
+  ['配置为空对象', {}],
+  ['旧 quick 配置即使含 Token 与域名', namedTunnelConfig({ mode: 'quick' })],
+  ['缺少 mode', { token: FAKE_TUNNEL_TOKEN, hostname: 'pocket.example.com' }],
+  ['缺少 Token', { mode: 'named', hostname: 'pocket.example.com' }],
+  ['缺少域名', { mode: 'named', token: FAKE_TUNNEL_TOKEN }],
+]) {
+  test(`service：${label} 拒绝公网启动，不下载或拉起隧道`, () => withHome(async (home) => {
+    const internals = stubInternals();
+    const service = createPocketService({
+      dshPort: 3080, port: 3081, home, internals,
+      ...(cfg === undefined ? {} : { getTunnelConfig: () => cfg }),
+    });
+    try {
+      await assert.rejects(() => service.startTunnel(), /固定域名.*Tunnel Token/);
+      await assert.rejects(() => service.startTunnel(), /固定域名.*Tunnel Token/, '失败后再次调用仍正常拒绝，无残留 in-flight');
+      assert.deepEqual(internals.started, [], '不得进入负责下载和启动的 Named 路径');
+      const status = await service.status();
+      assert.equal(status.proxyRunning, true, '未配置公网不影响 LAN 代理');
+      assert.equal(status.tunnelRunning, false);
+      assert.equal(status.tunnelUrl, null);
+      assert.equal(status.tunnelQr, null);
+      assert.equal(status.tunnelState.phase, 'error');
+      assert.equal(status.tunnelState.startedAt, null);
+      assert.equal(status.tunnelConfig.mode, 'named');
+      assert.equal(existsSync(join(home, 'dsh-pocket', 'tunnel-auto.json')), false, '失败不创建恢复标记');
+      assert.equal(existsSync(join(home, 'dsh-pocket', 'bin')), false, '失败不创建下载缓存');
+    } finally {
+      await service.dispose();
+    }
+  }));
+}
+
+test('service：并发开启 Named 单飞，重复开启复用，主动关闭杀一次', async () => {
+  let startCount = 0;
+  let killCount = 0;
+  let release;
+  let entered;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const started = new Promise((resolve) => { entered = resolve; });
+  const readyModes = [];
+  const service = createPocketService({
+    dshPort: 3080, port: 3081, getTunnelConfig: namedTunnelConfig,
+    onTunnelReady: (mode) => readyModes.push(mode),
+    internals: {
+      ...stubInternals(),
+      startNamedTunnel: async ({ token }) => {
+        assert.equal(token, FAKE_TUNNEL_TOKEN);
+        startCount += 1;
+        entered();
+        await gate;
+        return { url: null, kill: () => { killCount += 1; } };
+      },
+    },
+  });
+  try {
+    const requests = [service.startTunnel(), service.startTunnel(), service.startTunnel()];
+    await started;
+    assert.equal(startCount, 1, '并发调用只进入一次 Named 启动');
+    release();
+    assert.deepEqual(await Promise.all(requests), Array(3).fill('https://pocket.example.com'));
+    assert.equal(await service.startTunnel(), 'https://pocket.example.com', '已启动时复用 URL');
+    assert.equal(startCount, 1, '重复开启不创建额外进程');
+    assert.deepEqual(readyModes, ['named'], '就绪回调仅一次且只报告 named');
+    service.stopTunnel();
+    service.stopTunnel();
+    assert.equal(killCount, 1, '重复停止不会重复 kill');
+    assert.equal((await service.status()).tunnelRunning, false);
+  } finally {
+    release();
+    await service.dispose();
+  }
+});
+
+test('service：Named 进程异常退出清理公网状态，可再次开启', async () => {
+  let onExit;
+  let startCount = 0;
+  const service = createPocketService({
+    dshPort: 3080, port: 3081, getTunnelConfig: namedTunnelConfig,
+    internals: {
+      ...stubInternals(),
+      startNamedTunnel: async () => {
+        startCount += 1;
+        return { url: null, kill: () => {}, onExit: (cb) => { onExit = cb; } };
+      },
+    },
+  });
+  try {
+    await service.startTunnel();
+    onExit(17);
+    const dead = await service.status();
+    assert.equal(dead.tunnelRunning, false);
+    assert.equal(dead.tunnelUrl, null);
+    assert.equal(dead.tunnelQr, null);
+    assert.equal(dead.tunnelState.phase, 'error');
+    assert.match(dead.tunnelState.detail, /code=17/);
+    assert.equal(dead.tunnelState.startedAt, null);
+    assert.equal(await service.startTunnel(), 'https://pocket.example.com');
+    assert.equal(startCount, 2, '退出后可重新启动，而非复用死 URL');
+    service.stopTunnel();
+    onExit(0);
+    assert.equal((await service.status()).tunnelState.phase, 'idle', '主动停止后的退出通知不误报故障');
+  } finally {
+    await service.dispose();
+  }
+});
+
+test('RPC：保存 Named 仅落盘不启动，拒绝 quick；显式启动和 reset 均按配置生效', () => withHome(async () => {
+  const settings = await import('../lib/settings.mjs');
+  const { resetPocketState } = await import('../lib/index.js');
+  const internals = stubInternals();
+  const service = createPocketService({
+    dshPort: 3080, port: 3081, internals,
+    getTunnelConfig: () => ({ mode: settings.tunnelMode(), token: settings.tunnelToken(), hostname: settings.tunnelHostname() }),
+  });
+  const conn = fakeCtxConnection();
+  installPocketRpc({ connection: conn }, {
+    service,
+    getTunnelConfig: () => ({ mode: settings.tunnelMode(), hostname: settings.tunnelHostname(), tokenSet: Boolean(settings.tunnelToken()) }),
+    setTunnelConfig: settings.setNamedTunnelConfig,
+    resetPocket: resetPocketState,
+    log: { error() {}, warn() {} },
+  });
+  try {
+    const unconfigured = await conn.handler(POCKET_ENDPOINTS.tunnelStart, { disclaimer: true });
+    assert.equal(unconfigured.ok, false, '同意免责声明也不能绕过配置要求');
+    assert.equal(unconfigured.error.code, 'bad-request');
+    assert.match(unconfigured.error.message, /固定域名.*Tunnel Token/);
+    assert.deepEqual(internals.started, []);
+
+    const saved = await conn.handler(POCKET_ENDPOINTS.tunnelSetConfig, namedTunnelConfig());
+    assert.equal(saved.ok, true);
+    assert.deepEqual(saved.value.tunnelConfig, { mode: 'named', hostname: 'pocket.example.com', tokenSet: true });
+    assert.equal(saved.value.tunnelRunning, false, '保存不等于启动');
+    assert.equal(saved.value.tunnelUrl, null);
+    assert.deepEqual(internals.started, [], '保存不下载或启动 cloudflared');
+    assert.ok(!JSON.stringify(saved).includes(FAKE_TUNNEL_TOKEN), '保存响应不回显 Token');
+    const before = readFileSync(settings.settingsPath(), 'utf8');
+
+    const quick = await conn.handler(POCKET_ENDPOINTS.tunnelSetConfig, namedTunnelConfig({ mode: 'quick', hostname: 'other.example.com', token: 'fake-replacement-token-for-tests' }));
+    assert.equal(quick.ok, false, 'RPC 不接受已移除的 quick 模式');
+    assert.equal(quick.error.code, 'bad-request');
+    assert.equal(readFileSync(settings.settingsPath(), 'utf8'), before, '拒绝 quick 不改 Token 或域名');
+    assert.deepEqual(internals.started, []);
+
+    const denied = await conn.handler(POCKET_ENDPOINTS.tunnelStart, {});
+    assert.equal(denied.ok, false, '保存后显式开启仍须免责声明');
+    assert.deepEqual(internals.started, []);
+    const started = await conn.handler(POCKET_ENDPOINTS.tunnelStart, { disclaimer: true });
+    assert.equal(started.ok, true);
+    assert.equal(started.value.tunnelUrl, 'https://pocket.example.com');
+    assert.deepEqual(internals.started, [`named:${FAKE_TUNNEL_TOKEN}`]);
+
+    const unconfirmed = await conn.handler(POCKET_ENDPOINTS.pocketReset, {});
+    assert.equal(unconfirmed.ok, false, 'reset 必须显式确认');
+    assert.equal((await service.status()).tunnelRunning, true, '未确认不停止隧道');
+    const reset = await conn.handler(POCKET_ENDPOINTS.pocketReset, { confirm: true });
+    assert.equal(reset.ok, true);
+    assert.equal(reset.value.tunnelRunning, false, 'reset 先停止隧道');
+    assert.deepEqual(reset.value.tunnelConfig, { mode: 'named', hostname: '', tokenSet: false }, 'reset 回到未配置状态');
+    assert.equal(settings.tunnelAutoRestoreEnabled(), false, 'reset 关闭旧标记恢复资格');
+    const afterReset = await conn.handler(POCKET_ENDPOINTS.tunnelStart, { disclaimer: true });
+    assert.equal(afterReset.ok, false, 'reset 后不能回退到 Quick 启动');
+    assert.equal(afterReset.error.code, 'bad-request');
+    assert.deepEqual(internals.started, [`named:${FAKE_TUNNEL_TOKEN}`], 'reset 后未额外下载或启动');
+  } finally {
+    await service.dispose();
+  }
+}));
+
 test('RPC：status / tunnel.start / tunnel.stop / 未知端点', async () => {
   const internals = stubInternals();
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
   const conn = fakeCtxConnection();
   installPocketRpc({ connection: conn }, { service, log: { error() {}, warn() {} } });
 
@@ -211,7 +402,7 @@ test('RPC：status / tunnel.start / tunnel.stop / 未知端点', async () => {
   const started = await conn.handler(POCKET_ENDPOINTS.tunnelStart, { disclaimer: true });
   assert.equal(started.ok, true);
   assert.equal(started.value.tunnelRunning, true);
-  assert.equal(started.value.tunnelUrl, 'https://abc-123.trycloudflare.com');
+  assert.equal(started.value.tunnelUrl, 'https://pocket.example.com');
 
   const stopped = await conn.handler(POCKET_ENDPOINTS.tunnelStop, {});
   assert.equal(stopped.ok, true);
@@ -299,7 +490,7 @@ test('RPC：settings 写失败 → lan.setEnabled 回 ok:false（P1-1）', async
     writeFileSync(join(home, 'dsh-pocket'), 'not a dir');
     const { setLanEnabled } = await import('../lib/settings.mjs');
     const internals = stubInternals();
-    const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+    const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
     const conn = fakeCtxConnection();
     installPocketRpc({ connection: conn }, {
       service,
@@ -320,7 +511,7 @@ test('RPC：settings 写失败 → lan.setEnabled 回 ok:false（P1-1）', async
 test('RPC：mobile.rightbar.setEnabled 默认开启并回写到 status', async () => {
   const internals = stubInternals();
   let enabled = true;
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
   const conn = fakeCtxConnection();
   installPocketRpc({ connection: conn }, {
     service,
@@ -348,7 +539,7 @@ test('RPC：mobile.rightbar.setEnabled 默认开启并回写到 status', async (
 test('RPC：mobile.font.setSize 持久化并回写到 status', async () => {
   const internals = stubInternals();
   let size = 0;
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
   const conn = fakeCtxConnection();
   installPocketRpc({ connection: conn }, {
     service,
@@ -383,7 +574,7 @@ test('RPC：mobile.font.setSize 持久化并回写到 status', async () => {
 
 test('RPC：status 携带重启提示（restartNotice）', async () => {
   const internals = stubInternals();
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
   const conn = fakeCtxConnection();
   installPocketRpc({ connection: conn }, {
     service,
@@ -401,14 +592,14 @@ test('RPC：status 携带重启提示（restartNotice）', async () => {
 test('隧道进度：startTunnel 阶段透出到 status.tunnelState', async () => {
   const internals = {
     ...stubInternals(),
-    startTunnel: async ({ onPhase }) => {
+    startNamedTunnel: async ({ onPhase }) => {
       onPhase('downloading');
       onPhase('registering');
       onPhase('ready');
-      return { url: 'https://x.trycloudflare.com', kill: () => {} };
+      return { url: null, kill: () => {} };
     },
   };
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
   await service.startProxy();
   await service.startTunnel();
   const s = await service.status();
@@ -501,7 +692,8 @@ test('readRestartNotice：真实文件系统（无文件/坏 JSON/过期/有效�
     const n = await readRestartNotice();
     assert.equal(n.pid, 4242, '有效标记返回 pid');
   } finally {
-    process.env.DSH_HOME = prev;
+    if (prev === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prev;
     await fsp.rm(dir, { recursive: true, force: true });
   }
 });
@@ -529,14 +721,15 @@ test('consumeRestartNotice：读后即删（横幅只显示一次，不会一直
     const n2 = await consumeRestartNotice();
     assert.equal(n2, null, '消费后不再返回');
   } finally {
-    process.env.DSH_HOME = prev;
+    if (prev === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prev;
     await fsp.rm(dir, { recursive: true, force: true });
   }
 });
 
 test('RPC：restartNotice 读取抛错时 status 优雅降级为 null', async () => {
   const internals = stubInternals();
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
   const conn = fakeCtxConnection();
   installPocketRpc({ connection: conn }, {
     service,
@@ -552,7 +745,7 @@ test('RPC：restartNotice 读取抛错时 status 优雅降级为 null', async ()
 
 test('RPC：version 返回磁盘版本 current 与启动版本 loaded', async () => {
   const internals = stubInternals();
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
   const conn = fakeCtxConnection();
   installPocketRpc({ connection: conn }, {
     service,
@@ -570,7 +763,7 @@ test('RPC：version 返回磁盘版本 current 与启动版本 loaded', async ()
 
 test('RPC：version 返回 repository（安装来源仓库），旧 runUpdate 形状降级为 null', async () => {
   const internals = stubInternals();
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
   const conn = fakeCtxConnection();
   installPocketRpc({ connection: conn }, {
     service,
@@ -599,7 +792,7 @@ test('RPC：version 返回 repository（安装来源仓库），旧 runUpdate �
 
 test('RPC：update 对 fork/分支安装拦截一键更新，registry 不可达时放行', async () => {
   const internals = stubInternals();
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
   const realFetch = globalThis.fetch;
   const makeRunUpdate = () => {
     const calls = [];
@@ -658,7 +851,7 @@ test('isSameRepo/normalizeRepoUrl：fork 判定（更新横幅常显案）', asy
   assert.equal(isSameRepo('https://github.com/x/y', ''), false);
 });
 
-test('lib/index.js 模块可加载，apply 可调用（防模块级 ReferenceError 回归）', async () => {
+test('lib/index.js 模块可加载，apply 可调用（防模块级 ReferenceError 回归）', () => withHome(async () => {
   // 回归：pocketRestart 曾引用 apply 参数里的 internals，点「重启」抛 ReferenceError
   const mod = await import('../lib/index.js');
   assert.equal(typeof mod.apply, 'function');
@@ -674,7 +867,7 @@ test('lib/index.js 模块可加载，apply 可调用（防模块级 ReferenceErr
   };
   const stubService = {
     startProxy: async () => ({}), dispose: async () => {}, status: async () => ({}),
-    startTunnel: async () => 'https://x.trycloudflare.com', stopTunnel: () => {},
+    startTunnel: async () => 'https://pocket.example.com', stopTunnel: () => {},
   };
   // apply 内部用 ctx.effect 注册清理，返回值不是契约；这里只验证不抛错
   mod.apply(ctx, {}, {
@@ -684,7 +877,7 @@ test('lib/index.js 模块可加载，apply 可调用（防模块级 ReferenceErr
     restartNotice: async () => null,
   });
   assert.ok(true, 'apply 正常路径不抛错');
-});
+}));
 
 test('compareVersions：语义化版本比较', async () => {
   const { compareVersions } = await import('../client/api.js');
@@ -708,14 +901,14 @@ test('stop 竞态：stop 打断 in-flight 后立即 start，不会并发 spawn c
   const gateA = new Promise((r) => { releaseA = r; });
   const internals = {
     ...stubInternals(),
-    startTunnel: async ({ signal }) => {
+    startNamedTunnel: async ({ signal }) => {
       spawnCount += 1;
       await gateA; // 挂起直到 releaseA
       if (signal.aborted) throw new Error('cancelled');
-      return { url: 'https://a.trycloudflare.com', kill: () => {} };
+      return { url: null, kill: () => {} };
     },
   };
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
   await service.startProxy();
 
   const pA = service.startTunnel().catch(() => null); // A in-flight
@@ -764,7 +957,7 @@ test('tsinghuaBottleUrl：按平台/架构匹配清华 bottle（Windows 无匹�
         `,
       };
     }
-    return origFetch(url);
+    throw new Error(`Unexpected test fetch: ${url}`);
   };
   try {
     // Windows：无 Homebrew bottle → null
@@ -785,7 +978,7 @@ test('tsinghuaBottleUrl：按平台/架构匹配清华 bottle（Windows 无匹�
 
 test('桌面端（desktop=true）：update/restart 关闭，status 带标志，正常功能不受影响', async () => {
   const internals = stubInternals();
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
   const conn = fakeCtxConnection();
   installPocketRpc({ connection: conn }, {
     service,
@@ -832,7 +1025,7 @@ test('startProxy：端口被占（EADDRINUSE）时自动尝试下一个端口', 
       return { port: p, close: async () => {} };
     },
   };
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
   const proxy = await service.startProxy();
   assert.equal(attempts, 2, '第一个端口失败后重试');
   assert.equal(proxy.port, 3082, '自动换到下一个端口');
@@ -841,6 +1034,62 @@ test('startProxy：端口被占（EADDRINUSE）时自动尝试下一个端口', 
   assert.ok(st.lanUrl.includes(':3082'), 'URL 使用实际端口');
   await service.dispose();
 });
+
+for (const [label, mode, cfg, shouldRestore] of [
+  ['旧无 mode 标记 + 无配置', undefined, undefined, false],
+  ['旧无 mode 标记 + 旧 quick 配置', undefined, namedTunnelConfig({ mode: 'quick' }), false],
+  ['旧无 mode 标记 + Named 缺 Token', undefined, namedTunnelConfig({ token: '' }), false],
+  ['旧无 mode 标记 + Named 缺域名', undefined, namedTunnelConfig({ hostname: '' }), false],
+  ['旧无 mode 标记 + 禁止沿用恢复', undefined, namedTunnelConfig({ autoRestore: false }), false],
+  ['旧无 mode 标记 + 完整 Named 配置', undefined, namedTunnelConfig(), true],
+  ['旧无 mode 标记 + 显式允许 Named 恢复', undefined, namedTunnelConfig({ autoRestore: true }), true],
+  ['显式 quick 标记 + 完整 Named 配置', 'quick', namedTunnelConfig(), false],
+  ['显式 quick 标记 + 旧 quick 配置', 'quick', namedTunnelConfig({ mode: 'quick' }), false],
+  ['显式未知模式标记 + 完整 Named 配置', 'other', namedTunnelConfig(), false],
+  ['显式 Named 标记 + 无配置', 'named', undefined, false],
+  ['显式 Named 标记 + 缺 Token', 'named', namedTunnelConfig({ token: '' }), false],
+  ['显式 Named 标记 + 缺域名', 'named', namedTunnelConfig({ hostname: '' }), false],
+  ['显式 Named 标记 + 完整配置', 'named', namedTunnelConfig(), true],
+  ['显式 Named 标记不依赖旧模式恢复资格', 'named', namedTunnelConfig({ autoRestore: false }), true],
+]) {
+  test(`公网隧道自动恢复：${label}`, () => withHome(async (home) => {
+    const statePath = join(home, 'dsh-pocket', 'tunnel-auto.json');
+    mkdirSync(join(home, 'dsh-pocket'), { recursive: true });
+    writeFileSync(statePath, JSON.stringify({ at: 1, mode }));
+    const internals = stubInternals();
+    const service = createPocketService({
+      dshPort: 3080, port: 3081, home, internals,
+      ...(cfg === undefined ? {} : { getTunnelConfig: () => cfg }),
+      log: { info() {}, warn() {} },
+    });
+    try {
+      await service.restoreTunnelIfNeeded();
+      const status = await service.status();
+      assert.equal(status.tunnelRunning, shouldRestore);
+      assert.equal(status.tunnelUrl, shouldRestore ? 'https://pocket.example.com' : null);
+      assert.deepEqual(internals.started, shouldRestore ? [`named:${FAKE_TUNNEL_TOKEN}`] : [], '仅合格的 Named 配置允许下载和启动');
+      if (shouldRestore) {
+        let marker;
+        for (let i = 0; i < 50; i++) {
+          try { marker = JSON.parse(readFileSync(statePath, 'utf8')); } catch { marker = null; }
+          if (marker?.mode === 'named' && marker.at > 1) break;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.equal(marker?.mode, 'named', '恢复后标记升级为显式 named');
+        assert.ok(marker.at > 1, '恢复后重新写入当前开始时间');
+        assert.equal(marker.token, undefined, '恢复标记不记录 Token');
+      } else {
+        assert.equal(existsSync(statePath), false, '不合格或 quick 恢复标记必须清除');
+        assert.equal(existsSync(join(home, 'dsh-pocket', 'bin')), false, '拒绝恢复不创建下载缓存');
+        assert.equal(status.proxyRunning, false, '拒绝恢复不启动代理');
+        await service.restoreTunnelIfNeeded();
+        assert.deepEqual(internals.started, [], '清除后重复检查不会启动');
+      }
+    } finally {
+      await service.dispose();
+    }
+  }));
+}
 
 test('公网隧道自动恢复：开启时持久化标记，重启后 restoreTunnelIfNeeded 自动拉起（issue #11）', async () => {
   const fsp = await import('node:fs/promises');
@@ -851,22 +1100,25 @@ test('公网隧道自动恢复：开启时持久化标记，重启后 restoreTun
   let startCount = 0;
   const internals = {
     ...stubInternals(),
-    startTunnel: async () => {
+    startNamedTunnel: async () => {
       startCount += 1;
-      return { url: 'https://auto.trycloudflare.com', kill: () => {} };
+      return { url: null, kill: () => {} };
     },
   };
-  const service = createPocketService({ dshPort: 3080, port: 3081, home, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, home, internals, getTunnelConfig: namedTunnelConfig });
   await service.startProxy();
 
   // 开启隧道 → 持久化标记（persistAutoTunnel 是异步 fire-and-forget，等它落盘）
   await service.startTunnel();
   await new Promise((r) => setTimeout(r, 60));
   const statePath = path.join(home, 'dsh-pocket', 'tunnel-auto.json');
-  assert.ok((await fsp.readFile(statePath, 'utf8')).includes('"at"'), '开启后写入标记');
+  const marker = JSON.parse(await fsp.readFile(statePath, 'utf8'));
+  assert.ok(marker.at > 0, '开启后写入时间');
+  assert.equal(marker.mode, 'named', '开启后写入 Named 恢复标记');
+  assert.equal(marker.token, undefined, '恢复标记不含 Token');
 
   // 模拟重启：新 service 实例（相同 home）→ 自动恢复
-  const service2 = createPocketService({ dshPort: 3080, port: 3081, home, internals });
+  const service2 = createPocketService({ dshPort: 3080, port: 3081, home, internals, getTunnelConfig: namedTunnelConfig });
   await service2.startProxy();
   await service2.restoreTunnelIfNeeded();
   assert.equal(startCount, 2, '重启后自动拉起隧道');
@@ -881,7 +1133,7 @@ test('公网隧道自动恢复：开启时持久化标记，重启后 restoreTun
     await new Promise((r) => setTimeout(r, 20));
   }
   assert.equal(afterClose, null, '关闭后删除标记');
-  const service3 = createPocketService({ dshPort: 3080, port: 3081, home, internals });
+  const service3 = createPocketService({ dshPort: 3080, port: 3081, home, internals, getTunnelConfig: namedTunnelConfig });
   await service3.startProxy();
   await service3.restoreTunnelIfNeeded();
   assert.equal(startCount, 2, '无标记不自动恢复');
@@ -898,18 +1150,21 @@ test('公网隧道自动恢复：dispose（进程退出/重启）保留标记，
   let startCount = 0;
   const internals = {
     ...stubInternals(),
-    startTunnel: async () => {
+    startNamedTunnel: async () => {
       startCount += 1;
-      return { url: 'https://auto.trycloudflare.com', kill: () => {} };
+      return { url: null, kill: () => {} };
     },
   };
   const statePath = path.join(home, 'dsh-pocket', 'tunnel-auto.json');
 
-  const service1 = createPocketService({ dshPort: 3080, port: 3081, home, internals });
+  const service1 = createPocketService({ dshPort: 3080, port: 3081, home, internals, getTunnelConfig: namedTunnelConfig });
   await service1.startProxy();
   await service1.startTunnel();
   await new Promise((r) => setTimeout(r, 60));
-  assert.ok((await fsp.readFile(statePath, 'utf8')).includes('"at"'), '开启后写入标记');
+  const marker = JSON.parse(await fsp.readFile(statePath, 'utf8'));
+  assert.ok(marker.at > 0, '开启后写入时间');
+  assert.equal(marker.mode, 'named', '开启后写入 Named 恢复标记');
+  assert.equal(marker.token, undefined, '恢复标记不含 Token');
 
   // 模拟 DSH 正常重启：dispose（插件卸载）→ 隧道随进程被动消失，不是用户主动关闭 → 标记必须保留。
   // 回归背景：dispose 曾无条件 clearAutoTunnel，导致每次正常重启后隧道永远不会自动恢复
@@ -918,7 +1173,7 @@ test('公网隧道自动恢复：dispose（进程退出/重启）保留标记，
   await new Promise((r) => setTimeout(r, 30));
   assert.ok((await fsp.readFile(statePath, 'utf8')).includes('"at"'), 'dispose 保留自动恢复标记');
 
-  const service2 = createPocketService({ dshPort: 3080, port: 3081, home, internals });
+  const service2 = createPocketService({ dshPort: 3080, port: 3081, home, internals, getTunnelConfig: namedTunnelConfig });
   await service2.startProxy();
   await service2.restoreTunnelIfNeeded();
   assert.equal(startCount, 2, 'dispose 后重启仍自动恢复');
@@ -938,7 +1193,7 @@ test('公网隧道自动恢复：dispose（进程退出/重启）保留标记，
 
 test('RPC：局域网密码独立于公网；lanTokenRefresh 刷新并返回新密码（issue #18）', async () => {
   const internals = stubInternals();
-  const service = createPocketService({ dshPort: 3080, port: 3081, internals });
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
   const conn = fakeCtxConnection();
   let lan = '11111111';
   installPocketRpc({ connection: conn }, {
@@ -1062,7 +1317,7 @@ test('startTunnel 同步抛错后不残留 rejected 的 in-flight（TDZ 回归�
     internals,
     getTunnelConfig: () => {
       if (broken) throw new Error('config boom');
-      return { mode: 'quick' };
+      return namedTunnelConfig();
     },
   });
   await service.startProxy();
@@ -1070,7 +1325,7 @@ test('startTunnel 同步抛错后不残留 rejected 的 in-flight（TDZ 回归�
 
   broken = false;
   const url = await service.startTunnel();
-  assert.equal(url, 'https://abc-123.trycloudflare.com', '修好后能正常启动，没有残留失败态');
+  assert.equal(url, 'https://pocket.example.com', '修好后能正常启动，没有残留失败态');
   assert.equal((await service.status()).tunnelRunning, true, '隧道确实起来了');
   await service.dispose();
 });

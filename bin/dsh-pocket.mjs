@@ -3,7 +3,7 @@
 //
 // 用法：
 //   dsh-pocket                 # 局域网模式：手机同一 WiFi 扫码访问
-//   dsh-pocket --public        # 公网模式：cloudflared 隧道，人在外面也能访问
+//   dsh-pocket --public        # 公网模式：使用已配置的固定域名与 Tunnel Token
 //   dsh-pocket --port 3081     # 自定义代理端口（默认 3081；dsh web 保持 3080）
 //
 // 前提：dsh web 已在 127.0.0.1:3080 运行。
@@ -15,7 +15,8 @@ import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import { randomBytes, randomInt } from 'node:crypto';
 import { createPocketProxy, classifyHost } from '../lib/proxy.mjs';
-import { startQuickTunnel } from '../lib/tunnel.mjs';
+import { startNamedTunnel } from '../lib/tunnel.mjs';
+import { tunnelHostname, tunnelToken } from '../lib/settings.mjs';
 import { selectLanIPv4 } from '../lib/service.mjs';
 
 const require = createRequire(import.meta.url);
@@ -98,12 +99,19 @@ export function entryUrl(base, pin) {
   return u.toString();
 }
 
+export function resolvePublicConfig({ hostname = tunnelHostname(), token = tunnelToken() } = {}) {
+  if (!hostname || !token) {
+    throw new Error('公网访问需要先在设置 → 手机访问中配置自己的固定域名和 Tunnel Token | configure your own fixed hostname and Tunnel Token in Settings before using --public');
+  }
+  return { hostname, token, url: `https://${hostname}` };
+}
+
 function printHelp() {
   console.log(`dsh-pocket — 手机访问电脑上的 DeepSeek Harness
 
 用法：
   dsh-pocket             局域网模式（手机同一 WiFi）
-  dsh-pocket --public    公网模式（cloudflared 隧道，人在外面）
+  dsh-pocket --public    公网模式（使用已配置的固定域名与 Tunnel Token）
   dsh-pocket --port 3081 自定义代理端口
   dsh-pocket --host      自定义监听地址（默认 0.0.0.0）
   dsh-pocket --pin <值>  自定义访问密码（至少 ${MIN_PIN_LENGTH} 位；也可用环境变量 DSH_POCKET_PIN）
@@ -111,6 +119,9 @@ function printHelp() {
   dsh-pocket --help      帮助
 
 前提：dsh web 已在 127.0.0.1:3080 运行（npx @deepseek-ai/dsh web）。
+公网：先在同一 DSH_HOME 的「设置 → 手机访问」保存自己的固定域名与 Tunnel Token，
+并将 Cloudflare Service 指向 CLI 的实际代理端口（默认 http://127.0.0.1:3081）。
+未配置时 --public 会拒绝启动；不会分配随机域名。只用局域网无需配置公网。
 
 安全提醒：dsh web 能在这台机器上执行代码。默认会随机生成一个 8 位访问密码，
 二维码里已内嵌该密码（扫码直达），手动输入地址时需要填写。本机访问免密。
@@ -141,6 +152,7 @@ async function main() {
   }
   const pin = resolved.pin;
   const auth = buildAuth(pin);
+  const publicConfig = args.public ? resolvePublicConfig() : null;
 
   console.log('🚀 dsh-pocket 启动中…');
   const { port, close } = await createPocketProxy({ ...args, auth });
@@ -180,13 +192,13 @@ async function main() {
   if (args.public) {
     console.log('🌐 正在建立公网隧道（cloudflared）…');
     try {
-      tunnel = await startQuickTunnel({ port, signal: controller.signal });
+      tunnel = await startNamedTunnel({ token: publicConfig.token, signal: controller.signal });
       // 隧道进程跑着跑着挂了：CLI 没有状态轮询，只能靠这个回调提示，否则二维码一直挂着死链接
       tunnel.onExit?.((code) => {
         console.error(`\n⚠️  公网隧道已断开（code=${code}）。局域网二维码仍可用；要恢复公网请重启 dsh-pocket。`);
       });
-      printQr(entryUrl(tunnel.url, pin), '🌐 公网访问（人在外面也能用）：');
-      console.log('   隧道会持续运行；Ctrl+C 退出（下次启动会换新 URL）');
+      printQr(entryUrl(publicConfig.url, pin), '🌐 公网访问（自己的固定域名）：');
+      console.log('   隧道会持续运行；Ctrl+C 退出（域名不变，访问密码由本次 CLI 参数决定）');
     } catch (err) {
       console.error(`❌ 公网隧道失败：${err.message}（局域网二维码仍可用）`);
     }

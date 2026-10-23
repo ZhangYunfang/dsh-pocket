@@ -56,9 +56,10 @@ async function fixture(t) {
     apply(ctx, {}, {
       ...(home === undefined ? {} : { home }),
       createProxy: async () => ({ port: 3081, close: async () => {} }),
-      startTunnel: async () => {
+      startNamedTunnel: async ({ token }) => {
+        assert.equal(token, 'fake-cloudflared-token-for-entry-tests');
         starts += 1;
-        return { url: 'https://example.trycloudflare.com', kill() {} };
+        return { url: null, kill() {} };
       },
       lanIPv4: () => '192.168.1.2',
       lanCandidates: async () => ['192.168.1.2'],
@@ -69,6 +70,9 @@ async function fixture(t) {
     return {
       ready: () => waitFor(() => proxyReady, 'entry did not start its proxy'),
       call: (endpoint, payload = {}) => handler(endpoint, payload),
+      configure: () => handler(POCKET_ENDPOINTS.tunnelSetConfig, {
+        mode: 'named', hostname: 'pocket.example.com', token: 'fake-cloudflared-token-for-entry-tests',
+      }),
       dispose,
     };
   }
@@ -80,6 +84,8 @@ for (const desktop of [false, true]) {
     const f = await fixture(t);
     const first = f.mount({ desktop });
     await first.ready();
+    assert.equal((await first.configure()).ok, true);
+    assert.equal(f.starts(), 0, 'saving public configuration must not start a tunnel');
     const started = await first.call(POCKET_ENDPOINTS.tunnelStart, { disclaimer: true });
     assert.equal(started.ok, true);
     assert.equal(f.starts(), 1);
@@ -103,6 +109,8 @@ test('plugin entry preserves an explicit persistence home override', async (t) =
   const override = join(f.dir, 'override');
   const entry = f.mount({ home: override });
   await entry.ready();
+  assert.equal((await entry.configure()).ok, true);
+  assert.equal(f.starts(), 0, 'saving configuration must not start a tunnel');
   assert.equal((await entry.call(POCKET_ENDPOINTS.tunnelStart, { disclaimer: true })).ok, true);
   await waitFor(() => f.hasMarker(override), 'explicit persistence home was not used');
   assert.equal(await f.hasMarker(), false, 'DSH_HOME must not replace an explicit home');

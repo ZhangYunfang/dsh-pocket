@@ -5,22 +5,16 @@ import assert from 'node:assert/strict';
 import { writeFile, readFile, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startQuickTunnel, startNamedTunnel, firstMeaningfulErrorLine, cloudflaredEnv } from '../lib/tunnel.mjs';
+import { startNamedTunnel, firstMeaningfulErrorLine, cloudflaredEnv } from '../lib/tunnel.mjs';
 
 async function makeFakeCloudflared() {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-pocket-fake-cf-'));
   const bin = join(dir, 'cloudflared');
   const record = join(dir, 'argv.json');
-  // 假二进制：把 argv 写盘，再按模式打印让隧道"就绪"的行后退出
   const script = `#!/usr/bin/env node
 const fs = require('node:fs');
-fs.writeFileSync(${JSON.stringify(record)}, JSON.stringify(process.argv.slice(2)));
-const argv = process.argv.slice(2);
-if (argv.includes('--url')) {
-  process.stdout.write('https://abc123.trycloudflare.com\\n');
-} else {
-  process.stdout.write('INF Registered tunnel connection\\n');
-}
+fs.writeFileSync(${JSON.stringify(record)}, JSON.stringify({ argv: process.argv.slice(2), token: process.env.TUNNEL_TOKEN }));
+process.stdout.write('INF Registered tunnel connection\\n');
 `;
   await writeFile(bin, script, { mode: 0o755 });
   return { bin, record, dir };
@@ -41,36 +35,24 @@ const POSIX_ONLY = process.platform === 'win32'
   ? '需要 POSIX shebang 假二进制；Windows spawn 无扩展名脚本会 ENOENT'
   : false;
 
-test('issue #78: 快速隧道 --no-autoupdate 在全局位置（argv[0]）', { skip: POSIX_ONLY }, async () => {
-  const { bin, record, dir } = await makeFakeCloudflared();
-  try {
-    await withFakeBin(bin, async () => {
-      const ac = new AbortController();
-      const { url, kill } = await startQuickTunnel({ port: 3081, signal: ac.signal });
-      kill();
-      const argv = JSON.parse(await readFile(record, 'utf8'));
-      assert.ok(url.includes('trycloudflare.com'), '应解析到快速隧道 URL');
-      assert.equal(argv[0], '--no-autoupdate', '--no-autoupdate 必须是 argv 第一个（全局位置）');
-      assert.ok(argv.indexOf('tunnel') > argv.indexOf('--no-autoupdate'), '--no-autoupdate 必须在 tunnel 子命令之前');
-      assert.ok(argv.includes('--url'), '快速隧道应含 --url');
-    });
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
 test('issue #78: 命名隧道 --no-autoupdate 在全局位置（argv[0]，含 run）', { skip: POSIX_ONLY }, async () => {
   const { bin, record, dir } = await makeFakeCloudflared();
   try {
     await withFakeBin(bin, async () => {
       const ac = new AbortController();
-      const res = await startNamedTunnel({ token: 'faketoken', signal: ac.signal });
+      const token = 'fake-cloudflared-token-for-tests';
+      const res = await startNamedTunnel({ token, signal: ac.signal });
       res.kill();
-      const argv = JSON.parse(await readFile(record, 'utf8'));
+      const recorded = JSON.parse(await readFile(record, 'utf8'));
+      const { argv } = recorded;
       assert.equal(res.url, null, '命名隧道 url 应为 null（由调用方拼固定域名）');
       assert.equal(argv[0], '--no-autoupdate', '--no-autoupdate 必须是 argv 第一个（全局位置）');
       assert.ok(argv.indexOf('tunnel') > argv.indexOf('--no-autoupdate'), '--no-autoupdate 必须在 tunnel 子命令之前');
       assert.ok(argv.includes('run'), '命名隧道应含 run 子命令');
+      assert.deepEqual(argv, ['--no-autoupdate', 'tunnel', 'run', '--protocol', 'http2']);
+      assert.equal(recorded.token, token, 'Token 只通过环境变量传递');
+      assert.ok(!argv.includes(token) && !argv.includes('--token'), 'Token 不得进入命令行');
+      assert.ok(!argv.includes('--url'), '不得启动随机 URL 隧道');
     });
   } finally {
     await rm(dir, { recursive: true, force: true });
