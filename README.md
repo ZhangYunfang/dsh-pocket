@@ -75,11 +75,15 @@ npm install -g @deepseek-ai/dsh     # 全局安装；验证：dsh --version
 
 ```sh
 # 1. 装插件（一个包全都有）
-dsh plugin --profile web add dsh-pocket -w
+dsh plugin --profile web add github:daha1216/dsh-pocket -w
 
 # 2. 重启 dsh web
 npx @deepseek-ai/dsh web
 ```
+
+> **装的是哪个包**：本仓库是 [dsh-pocket](https://github.com/shaobeichen/dsh-pocket) 的 fork。npm 上同名的 `dsh-pocket` 是上游作者的包（当前 2.12.0），**不是**这里的 3.x。请用上面带 GitHub 地址的命令安装。
+>
+> **兼容性**：`engines.dsh` 声明 `^0.2.0-rc.1`，即 **DSH 0.2.0-rc.1 及以上、0.3.0 之前**。装到不匹配的版本时，插件管理器会以 `incompatible-version` 明确拒绝；确实要在别的版本上试，可用 `dsh plugin allow-version` 加一次性豁免。DSH 升到 0.3.x 后需要本插件发新版放开范围。
 
 ### 局域网（同一 WiFi）
 
@@ -106,7 +110,7 @@ npx @deepseek-ai/dsh web
 
 **升级兼容**：旧 Quick Tunnel 的开启/恢复标记不会恢复随机隧道；未配置时公网保持关闭。旧 Named Tunnel 的完整固定域名与 Token 配置可以继续使用；只有此前已开启、保留恢复标记且配置完整的命名隧道会在 DSH 重启后自动恢复。恢复出厂设置会关闭公网并清除域名、Token 和恢复标记，重新配置前不会开启。
 
-> 更新到新版本：`dsh plugin --profile web update dsh-pocket --latest -w`（跨大版本时 `--latest` 是必须的，`^0.x` 范围不会自动升到 1.x）。
+> 更新到新版本：重新执行上面的 `add` 命令即可（GitHub 地址不带 tag，装到的是默认分支最新提交）。想锁版本就写成 `github:daha1216/dsh-pocket#v3.0.2`，之后更新时把 tag 换成新版本号再 `add` 一次。
 
 ### CLI 公网访问
 
@@ -143,7 +147,7 @@ Cloudflare 域名路由的 **Service 必须指向 CLI 的实际监听端口**（
 | 想换端口（issue #70）                       | 插件模式：在 `$DSH_HOME/dsh-pocket/settings.json` 写 `"proxyPort": 3082` 后重启 `dsh web`。CLI 模式：`dsh-pocket --port 3082`。端口被占会报 `EADDRINUSE`，杀掉旧进程或换一个端口                                                                                                                                                                        |
 | 想给访客一个临时密码                        | 暂不支持：issue #69 的「临时访问 PIN」功能已在 2.6.x 移除（撤销时会崩）。现在分享访问：把主密码或 `?token=<主密码>` 链接发给对方，用完在设置页点「刷新」换掉即可                                                                                                                                                                                        |
 | Linux 服务器装不上 cloudflared（issue #45） | 远程 Linux 国内/企业网下所有 CDN 源（GitHub/ghproxy/gh.ddlc/gh-proxy）都连不上时：在服务器上手动装 `cloudflared`（如 `apt install cloudflared`、`dnf install cloudflared`、或下载 tgz 解压到任意目录），然后在 `$DSH_HOME/dsh-pocket/settings.json` 加 `"cloudflaredPath": "/path/to/cloudflared"`，重启 `dsh web` 后插件直接调用它，**不再走自动下载** |
-| 版本停在 0.x 升不上去                       | `^0.x` 范围不允许升到 1.x：更新用 `--latest`（`dsh plugin --profile web update dsh-pocket --latest -w`）                                                                                                                                                                                                                                                |
+| 装完提示 `incompatible-version`             | 本插件要求 DSH **0.2.0-rc.1 ~ 0.2.x**：`dsh --version` 确认版本，升级 DSH，或用 `dsh plugin allow-version` 加一次性豁免 |
 | 公网 `error 1033`                           | 见下方「公网隧道常见问题」——多半是本机代理/VPN（Clash 等 TUN 模式）掐断了隧道                                                                                                                                                                                                                                                                           |
 | 点「重启 dsh web」后页面提示进程在后台运行  | 自重启的新进程是 detached 后台进程（不挂终端），是页内更新的标准做法；停止它：macOS/Linux `lsof -ti :3080 \| xargs kill -9`；Windows `netstat -ano \| findstr :3080` → `taskkill /PID <PID> /F`（日志在 `$DSH_HOME` 下 `dsh-pocket-restart-*.log`）                                                                                                     |
 

@@ -75,11 +75,15 @@ npm install -g @deepseek-ai/dsh     # global install; verify: dsh --version
 
 ```sh
 # 1. Install the plugin (everything in one package)
-dsh plugin --profile web add dsh-pocket -w
+dsh plugin --profile web add github:daha1216/dsh-pocket -w
 
 # 2. Restart dsh web
 npx @deepseek-ai/dsh web
 ```
+
+> **Which package is this**: this repository is a fork of [dsh-pocket](https://github.com/shaobeichen/dsh-pocket). The `dsh-pocket` package on npm belongs to the upstream author (currently 2.12.0) and is **not** this 3.x line. Install with the GitHub address shown above.
+>
+> **Compatibility**: `engines.dsh` declares `^0.2.0-rc.1`, i.e. **DSH 0.2.0-rc.1 up to (but not including) 0.3.0**. On an unsupported runtime the plugin manager refuses with `incompatible-version`; add a one-off exemption with `dsh plugin allow-version` if you really need to try it elsewhere. Once DSH reaches 0.3.x this plugin needs a new release to widen the range.
 
 ### LAN (same Wi-Fi)
 
@@ -106,7 +110,7 @@ The public address is your configured hostname and **does not change on restart*
 
 **Upgrade compatibility:** old Quick Tunnel enable/restore markers do not restore random tunnels; public access stays off without configuration. Complete existing Named Tunnel hostname/Token configurations remain usable. Only a previously enabled named tunnel with a restore marker and complete configuration auto-restores after a DSH restart. A factory reset stops public access and clears the hostname, Token and restore marker; public access stays off until configured again.
 
-> Upgrading: `dsh plugin --profile web update dsh-pocket --latest -w` (`--latest` is required across major versions — a `^0.x` range won't auto-jump to 1.x).
+> Upgrading: re-run the `add` command above (the GitHub address carries no tag, so it installs the latest commit on the default branch). To pin a version, write `github:daha1216/dsh-pocket#v3.0.2` instead, and re-`add` with the new tag when you want to move.
 
 ### CLI public access
 
@@ -143,7 +147,7 @@ The Cloudflare hostname route's **Service must target the CLI's actual listening
 | Want a different port (issue #70)                                               | Plugin mode: write `"proxyPort": 3082` into `$DSH_HOME/dsh-pocket/settings.json` and restart `dsh web`. CLI mode: `dsh-pocket --port 3082`. If the port is taken you'll get `EADDRINUSE` — kill the old process or pick another one                                                                                                                                                                                              |
 | Issue a temporary PIN to a guest                                                | Not available: the temporary access PIN feature (issue #69) was removed in 2.6.x (it crashed on revoke). To share access, send the main PIN or a `?token=<main PIN>` link, then hit "Refresh" in Settings once the guest is done                                                                                                                                                                                                 |
 | cloudflared install fails on a remote Linux server (issue #45)                  | If all CDN sources (GitHub / ghproxy / gh.ddlc / gh-proxy) are unreachable on a remote Linux host, install `cloudflared` yourself (e.g. `apt install cloudflared`, `dnf install cloudflared`, or download the tgz and unpack it), then add `"cloudflaredPath": "/path/to/cloudflared"` into `$DSH_HOME/dsh-pocket/settings.json` and restart `dsh web`. The plugin will then use that binary directly and skip the auto-download |
-| Version stuck below 1.x                                                         | `^0.x` ranges never jump to 1.x: update with `--latest` (`dsh plugin --profile web update dsh-pocket --latest -w`)                                                                                                                                                                                                                                                                                                               |
+| Install fails with `incompatible-version`                                       | This plugin requires DSH **0.2.0-rc.1 – 0.2.x**: check `dsh --version`, upgrade DSH, or add a one-off exemption with `dsh plugin allow-version`                                                                                                                                                                                                                                                                                   |
 | Public `error 1033`                                                             | See "Public tunnel troubleshooting" below — usually a local proxy/VPN (Clash etc. TUN mode) killing the tunnel                                                                                                                                                                                                                                                                                                                   |
 | After "Restart dsh web", the page says the process is running in the background | The new process from in-page self-restart is a detached background process (not attached to your terminal) — that's the standard way to apply updates in-page; stop it: macOS/Linux `lsof -ti :3080 \| xargs kill -9`; Windows `netstat -ano \| findstr :3080` → `taskkill /PID <PID> /F` (logs under `$DSH_HOME` as `dsh-pocket-restart-*.log`)                                                                                 |
 
