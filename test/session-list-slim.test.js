@@ -12,7 +12,11 @@ import { brotliDecompressSync, gunzipSync } from 'node:zlib';
 
 import { createPocketProxy } from '../lib/proxy.mjs';
 
-const FAT_KEYS = ['contextHeaders', 'retrace/forkmap', 'retrace/versions', 'watcherInsights', 'turnOutline'];
+const FAT_KEYS = ['contextHeaders', 'retrace/forkmap', 'retrace/versions', 'turnOutline'];
+// watcherInsights 故意不在剥离清单里：dsh-watcher 的统计面板直接扫 session/list 的
+// projections.values.watcherInsights（src/insights/presentation.mjs scanSessions），
+// 剥掉会让手机端每个会话都显示「尚无 Watcher 统计缓存」。见 lib/proxy.mjs 的注释。
+const KEPT_FAT_KEYS = ['watcherInsights'];
 
 /** 假上游：按请求体里的 marker 造一份带胖投影的 session/list 响应，并统计命中次数。 */
 async function fakeSessionListUpstream() {
@@ -26,7 +30,7 @@ async function fakeSessionListUpstream() {
       try { marker = JSON.parse(raw).payload?.marker ?? ''; } catch { marker = ''; }
       hits.push({ path: req.url, marker });
       const values = { keepMe: `keep:${marker}`, contextTimeline: { bytes: 1 } };
-      for (const key of FAT_KEYS) values[key] = { pad: 'x'.repeat(2048), marker };
+      for (const key of [...FAT_KEYS, ...KEPT_FAT_KEYS]) values[key] = { pad: 'x'.repeat(2048), marker };
       const body = JSON.stringify({ result: { value: { items: [{ id: `s-${marker}`, title: `t-${marker}`, projections: { values } }] } } });
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(body);
@@ -90,6 +94,8 @@ test('session/list 瘦身：剥掉约定的胖投影字段，保留其余字段'
     assert.equal(res.status, 200);
     const values = res.json.result.value.items[0].projections.values;
     for (const key of FAT_KEYS) assert.equal(values[key], undefined, `胖字段 ${key} 应被剥掉`);
+    // 回归：watcher 面板从 list 读这个字段，代理不得删除（否则统计面板全空）
+    assert.deepEqual(values.watcherInsights, { pad: 'x'.repeat(2048), marker: 'a' }, 'watcherInsights 必须原样保留');
     assert.equal(values.keepMe, 'keep:a');
     assert.deepEqual(values.contextTimeline, { bytes: 1 });
     assert.equal(res.headers['content-encoding'], 'br');
