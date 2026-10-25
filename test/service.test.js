@@ -938,42 +938,29 @@ test('killHint：按平台返回停止命令（Windows 无 lsof）', async () =>
   assert.ok(!hint.includes('undefined'), '端口正确插入');
 });
 
-test('tsinghuaBottleUrl：按平台/架构匹配清华 bottle（Windows 无匹配；mock 目录，不依赖外网）', async () => {
-  const { tsinghuaBottleUrl } = await import('../lib/tunnel.mjs');
-  const origFetch = globalThis.fetch;
-  // mock 清华目录页（CI 在境外，真实访问清华会超时导致测试抖动）
-  globalThis.fetch = async (url) => {
-    if (String(url).includes('mirrors.tuna.tsinghua.edu.cn')) {
-      return {
-        ok: true,
-        status: 200,
-        text: async () => `
-          <a href="cloudflared-2026.8.2.arm64_sequoia.bottle.tar.gz">
-          <a href="cloudflared-2026.8.2.arm64_sonoma.bottle.tar.gz">
-          <a href="cloudflared-2026.8.2.arm64_tahoe.bottle.tar.gz">
-          <a href="cloudflared-2026.8.2.arm64_linux.bottle.tar.gz">
-          <a href="cloudflared-2026.8.2.sonoma.bottle.tar.gz">
-          <a href="cloudflared-2026.8.2.x86_64_linux.bottle.tar.gz">
-        `,
-      };
-    }
-    throw new Error(`Unexpected test fetch: ${url}`);
-  };
-  try {
-    // Windows：无 Homebrew bottle → null
-    assert.equal(await tsinghuaBottleUrl({ os: 'windows', a: 'amd64' }), null, 'Windows 不走清华');
-    // macOS arm64 → 清华 arm64_ 开头的 bottle URL
-    const macUrl = await tsinghuaBottleUrl({ os: 'darwin', a: 'arm64' });
-    assert.ok(macUrl && macUrl.includes('mirrors.tuna.tsinghua.edu.cn'), 'macOS 有清华 URL: ' + macUrl);
-    assert.ok(/arm64_(sequoia|sonoma|tahoe)\.bottle\.tar\.gz$/.test(macUrl), '匹配 arm64 macOS bottle: ' + macUrl);
-    // macOS Intel → 无 arm64 前缀的 bottle
-    const intelUrl = await tsinghuaBottleUrl({ os: 'darwin', a: 'amd64' });
-    assert.ok(intelUrl && !/arm64_/.test(intelUrl), 'Intel 用无前缀 bottle: ' + intelUrl);
-    // Linux：Homebrew bottle 的 ELF 解释器是占位符，不能直接用 → 跳过清华（issue #22）
-    assert.equal(await tsinghuaBottleUrl({ os: 'linux', a: 'arm64' }), null, 'Linux 不走清华（Homebrew bottle 不可用）');
-  } finally {
-    globalThis.fetch = origFetch;
+test('cloudflared 下载源完整性门控：bottle 已移除，摘要不可用时只留官方直链（不依赖外网）', async () => {
+  const tunnel = await import('../lib/tunnel.mjs');
+  // 清华 Homebrew bottle 是重打包产物，字节与官方资产不同、无法对齐 GitHub 公布的
+  // sha256 摘要——供应链修复后不再作为下载源（导出已删除）。
+  assert.equal(tunnel.tsinghuaBottleUrl, undefined, 'tsinghuaBottleUrl 应已移除');
+  // 摘要不可用时：官方直链放行，第三方加速源与伪装前缀一律拒绝
+  const asset = 'cloudflared-windows-amd64.exe';
+  assert.equal(tunnel.sourceAllowedWithoutDigest(tunnel.OFFICIAL_ASSET_URL(asset)), true, '官方直链放行');
+  for (const mirror of ['https://ghproxy.net/', 'https://gh.ddlc.top/', 'https://gh-proxy.com/']) {
+    const url = mirror + tunnel.OFFICIAL_ASSET_URL(asset);
+    assert.equal(tunnel.sourceAllowedWithoutDigest(url), false, `镜像拒绝: ${mirror}`);
   }
+  assert.equal(
+    tunnel.sourceAllowedWithoutDigest('https://github.com.evil.example.com/cloudflare/cloudflared/x'),
+    false,
+    '伪装前缀拒绝',
+  );
+  // 摘要形态：sha256:<64hex> 归一；其它一律 null（不猜）
+  const hex = 'b'.repeat(64);
+  assert.equal(tunnel.normalizeDigest(`sha256:${hex}`), hex);
+  assert.equal(tunnel.normalizeDigest(`sha256:${hex.toUpperCase()}`), hex);
+  assert.equal(tunnel.normalizeDigest('sha256:abc'), null);
+  assert.equal(tunnel.normalizeDigest(undefined), null);
 });
 
 test('桌面端（desktop=true）：update/restart 关闭，status 带标志，正常功能不受影响', async () => {
