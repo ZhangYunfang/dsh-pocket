@@ -49,6 +49,36 @@ async function fakeBrokenUpstream() {
   return { port: server.address().port, server };
 }
 
+/** 假上游：按真实 RPC 信封回包，把请求里的 rpcId 原样带回（模拟 DSH 宿主）。 */
+async function fakeEnvelopeUpstream() {
+  const hits = [];
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      let rpcId = null;
+      let marker = '';
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        rpcId = parsed.rpcId ?? null;
+        marker = parsed.payload?.marker ?? '';
+      } catch { /* 忽略 */ }
+      hits.push({ rpcId, marker });
+      const values = { keepMe: `keep:${marker}` };
+      for (const key of FAT_KEYS) values[key] = { pad: 'x'.repeat(2048) };
+      const body = JSON.stringify({
+        rpcId,
+        type: 'server-response',
+        result: { value: { items: [{ id: 's-envelope', title: 't', projections: { values } }] } },
+      });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(body);
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return { port: server.address().port, hits, server };
+}
+
 /** POST /api/session/list，返回解析后的 JSON 与响应头。 */
 function postSessionList(port, payload, acceptEncoding = 'br') {
   return new Promise((resolve, reject) => {
@@ -145,6 +175,27 @@ test('session/list 瘦身：响应不是可解析 JSON 时原样透传（不丢�
     const res = await postSessionList(proxy.port, { payload: { marker: 'x' } }, 'identity');
     assert.equal(res.status, 200);
     assert.equal(res.text, 'not-json-at-all');
+  } finally {
+    await proxy.close();
+    up.server.close();
+  }
+});
+
+test('session/list 瘦身：rpcId 不同的同一次调用仍命中缓存，且回当前 rpcId', async () => {
+  // 真实客户端每次调用都生成新的 rpcId。缓存键若是含 rpcId 的请求体摘要，
+  // 缓存就永远命不中；命中时若回上一次的 rpcId，客户端对不上号会丢弃整包。
+  const up = await fakeEnvelopeUpstream();
+  const proxy = await createPocketProxy({ port: 0, host: '127.0.0.1', upstream: { host: '127.0.0.1', port: up.port } });
+  try {
+    const first = await postSessionList(proxy.port, { rpcId: 'rpc-1', method: 'session/list', payload: { cursor: null } });
+    const second = await postSessionList(proxy.port, { rpcId: 'rpc-2', method: 'session/list', payload: { cursor: null } });
+    assert.equal(first.json.rpcId, 'rpc-1');
+    assert.equal(second.json.rpcId, 'rpc-2', '命中缓存必须回当前请求的 rpcId');
+    assert.equal(second.headers['x-dsh-pocket-slim-cache'], 'hit', 'rpcId 不同不应导致缓存失效');
+    assert.equal(second.json.result.value.items[0].id, 's-envelope');
+    // 命中在响应阶段（要等上游响应头才决定瘦身），所以上游各打一次；
+    // 省下的是整包解压 + 40MB JSON 解析/重序列化。
+    assert.equal(up.hits.length, 2);
   } finally {
     await proxy.close();
     up.server.close();

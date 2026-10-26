@@ -18,13 +18,17 @@ function makePayload(size) {
 }
 
 /** 支持/不支持 Range 的服务器。 */
-async function rangeServer(payload, { supportRange }) {
-  const server = createServer((req, res) => {
+async function rangeServer(payload, { supportRange, probeDelayMs = 0, probeSize } = {}) {
+  const server = createServer(async (req, res) => {
     const range = req.headers.range;
     if (supportRange && range) {
       const m = /bytes=(\d+)-(\d+)/.exec(range);
       const start = Number(m[1]);
       const end = Number(m[2]);
+      // 只延迟"探针那一小段"（从 0 开始的短区间），模拟慢网络
+      if (probeDelayMs > 0 && start === 0 && probeSize && end === probeSize - 1) {
+        await new Promise((r) => setTimeout(r, probeDelayMs));
+      }
       res.writeHead(206, {
         'content-type': 'application/octet-stream',
         'content-range': `bytes ${start}-${end}/${payload.length}`,
@@ -59,6 +63,102 @@ test('downloadFile：支持 Range 时多线程分块，合并后字节与源一�
   } finally {
     await rm(dir, { recursive: true, force: true });
     await new Promise((r) => server.close(r));
+  }
+});
+
+// 生产阈值 MIN_PARALLEL_SIZE=8MiB / PROBE_SIZE=2MiB 让"真跑一次分块"要下载 8MB+
+// 且探针必须慢于 300KB/s（本地回环永远达不到），所以分块分支此前在测试里根本
+// 走不到（旧用例标称"多线程"实际是单线程）。这里把内部阈值调到测试量级：
+// 文件 256KB、探针 16KB、阈值 1000B/ms，并让服务器只在探针那段延迟 600ms
+// （探针要慢过 500ms 才会进入测速判定，见 downloadFile 里的 probeMs < 500 短路），
+// 从而在本地稳定触发 8 段并发下载 + mergeParts 合并路径。
+test('downloadFile：慢网络下真的走 8 段并发并正确合并（覆盖 mergeParts）', async () => {
+  const payload = makePayload(256 * 1024);
+  const probeSize = 16 * 1024;
+  const { port, server } = await rangeServer(payload, {
+    supportRange: true, probeDelayMs: 600, probeSize,
+  });
+  const dir = await mkdtemp(join(tmpdir(), 'dl-merge-'));
+  try {
+    const dest = join(dir, 'out.bin');
+    const seen = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (input, init) => {
+      const r = init?.headers?.Range ?? init?.headers?.range;
+      if (r) seen.push(r);
+      return origFetch(input, init);
+    };
+    let len;
+    try {
+      len = await downloadFile(`http://127.0.0.1:${port}/cf`, dest, {
+        segments: 8, minParallelSize: 64 * 1024, probeSize, slowSpeedThreshold: 1000,
+      });
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+    assert.equal(len, payload.length, '返回总字节数');
+    const got = await readFile(dest);
+    assert.ok(got.equals(payload), '分块合并后字节与源完全一致');
+    // 探针一条 + 8 段分块（探针 0-16383，另 8 条覆盖全文件）
+    assert.equal(seen.length, 9, '探针 + 8 段范围请求，实际: ' + JSON.stringify(seen));
+    assert.ok(seen.includes('bytes=0-16383'), '先发探针');
+    assert.ok(seen.includes('bytes=0-32767'), '分块从 0 开始（探针被丢弃后全量重下）');
+    assert.ok(seen.includes(`bytes=${payload.length - 32768}-${payload.length - 1}`), '最后一段到文件末尾');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('downloadFile：探针够快则不切多线程，只发探针 + 一次剩余区间', async () => {
+  const payload = makePayload(256 * 1024);
+  const { port, server } = await rangeServer(payload, { supportRange: true });
+  const dir = await mkdtemp(join(tmpdir(), 'dl-fast-'));
+  try {
+    const dest = join(dir, 'out.bin');
+    const seen = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (input, init) => {
+      const r = init?.headers?.Range ?? init?.headers?.range;
+      if (r) seen.push(r);
+      return origFetch(input, init);
+    };
+    try {
+      await downloadFile(`http://127.0.0.1:${port}/cf`, dest, {
+        segments: 8, minParallelSize: 64 * 1024, probeSize: 16 * 1024, slowSpeedThreshold: 0.0001,
+      });
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+    const got = await readFile(dest);
+    assert.ok(got.equals(payload), '单线程拼接后字节一致');
+    assert.equal(seen.length, 2, '只有探针 + 剩余区间，实际: ' + JSON.stringify(seen));
+    assert.equal(seen[0], 'bytes=0-16383');
+    assert.equal(seen[1], `bytes=16384-${payload.length - 1}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('verifySha256：摘要匹配才通过，且接受裸 hex 与 sha256: 前缀', async () => {
+  const { createHash } = await import('node:crypto');
+  const { writeFile } = await import('node:fs/promises');
+  const { verifySha256 } = await import('../lib/tunnel.mjs');
+  const dir = await mkdtemp(join(tmpdir(), 'sha-'));
+  try {
+    const f = join(dir, 'blob.bin');
+    const body = makePayload(4096);
+    await writeFile(f, body);
+    const hex = createHash('sha256').update(body).digest('hex');
+    assert.equal((await verifySha256(f, `sha256:${hex}`)).ok, true, '带前缀命中');
+    assert.equal((await verifySha256(f, hex.toUpperCase())).ok, true, '裸大写 hex 也命中');
+    const bad = await verifySha256(f, 'f'.repeat(64));
+    assert.equal(bad.ok, false, '哈希不符必须失败');
+    assert.equal(bad.actual, hex, '回传实际哈希便于报错定位');
+    assert.equal((await verifySha256(f, 'deadbeef')).ok, false, '长度不对的摘要一律失败（不静默放行）');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
 

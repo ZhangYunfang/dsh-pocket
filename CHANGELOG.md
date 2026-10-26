@@ -1,3 +1,20 @@
+## [3.0.3](https://github.com/daha1216/dsh-pocket/compare/v3.0.2...v3.0.3) (2026-10-27)
+
+> 3.0.0–3.0.2 是 named-only 安全加固线（关闭 semantic-release 的 npm 发布后未再生成条目），本版起恢复手写记录。
+
+### Bug Fixes
+
+* **service:** 引入卸载门与代理世代号，消除启停竞态——dispose 后在途的 createProxy 落地会自行关闭，不再留下插件卸载后仍在监听的端口；startTunnel 提前建 AbortController，代理启动窗口内 stopTunnel 能真正取消
+* **service:** 隧道 onExit 按对象身份比对，上一代进程的迟到退出不再把刚起来的隧道从状态里抹掉
+* **delete:** 删除会话在 payload 改名或目录搬迁半途失败时逆序回滚，"删除失败"不再等于会话凭空消失（既扫不到也恢复不了）
+* **tunnel:** cloudflared 下载改为比对 GitHub Release 资产的 sha256 digest，镜像投毒/中间人可被识别并丢弃；API 不可达时降级为尺寸校验但显式告警，不再只验"大于 1MB"
+* **proxy:** WebSocket 心跳只在帧边界插入 Ping，控制帧不再落进大消息 payload 触发浏览器 1002 断开
+* **proxy:** 206 分片响应不再套 Content-Encoding；带失效 cookie 走 `?token=` 时正确换发，不必手清 cookie
+* **proxy:** session/list 瘦身缓存加条目与字节预算，缓存键去掉 rpcId（命中时回填当前 rpcId），真实客户端能命中
+* **rpc:** fileRead 相对路径按会话 `header.cwd` 解析，多工作区下不再读错项目；realpath 之后再判敏感路径与工作区边界
+* **settings:** 设置文件 rename 退路不再先删目标文件（失败可恢复）；PIN 写盘失败、恢复出厂不完整都会在设置页告警，不再宣称已保存
+* **mobile:** `?dsh-layout=auto` 成为权威不被残留 localStorage 覆盖；复制文件改用会话 provenance；fileGuard 在两个 await 后复查 active；设置页轮询丢弃乱序旧快照；捏合只拦放大、缩小永远放行；上游弹层补焦点约束与焦点归还
+
 ## [2.10.6](https://github.com/shaobeichen/dsh-pocket/compare/v2.10.5...v2.10.6) (2026-09-10)
 
 

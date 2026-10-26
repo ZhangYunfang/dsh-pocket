@@ -91,6 +91,10 @@ export function startFileGuard(
   readFile: (path: string) => Promise<ReadFileResponse>,
   t: (key: string) => string,
 ): () => void {
+  // 卸载标记：复制是「RPC + 写剪贴板」两段 await，回来后可能已经热重载/切布局，
+  // 此时 toast 容器和按钮都已被上一个实例回收。继续往 document 上写会留下
+  // 无主节点（悬空 toast 永不消失）并把旧实例的文案盖到新实例上。
+  let disposed = false
   /** {占位符} 手工插值（与 client/index.jsx 的 fmt 同款）：不依赖宿主 t() 的
    *  插值能力，避免行为不一致。 */
   const fmt = (key: string, vars?: Record<string, string | number>): string => {
@@ -254,6 +258,7 @@ export function startFileGuard(
         btn.textContent = '…'
         try {
           const res = await readFile(filePath)
+          if (disposed) return
           if (!res?.ok) {
             showToast(res?.error?.message ?? t('fileCopyFailed'))
             return
@@ -267,6 +272,7 @@ export function startFileGuard(
             return
           }
           const copied = await copyText(content)
+          if (disposed) return
           if (copied) {
             const kb = Math.max(1, Math.round(size / 1024))
             showToast(fmt('fileCopyDone', { kb }))
@@ -275,10 +281,14 @@ export function startFileGuard(
             showTextFallback(content) // 光提示「手动选择」没有下文：给出可选中文本
           }
         } catch (err) {
-          showToast(err instanceof Error ? err.message : t('fileCopyFailed'))
+          if (!disposed) showToast(err instanceof Error ? err.message : t('fileCopyFailed'))
         } finally {
-          btn.disabled = false
-          btn.textContent = t('fileCopy')
+          // 按钮可能已被卸载（React 重渲染换掉了整行）：写回的是脱离文档的
+          // 死节点，不报错但也没意义；判一下，语义更清楚。
+          if (btn.isConnected) {
+            btn.disabled = false
+            btn.textContent = t('fileCopy')
+          }
         }
       })
       el.parentElement?.insertBefore(btn, el.nextSibling)
@@ -345,6 +355,7 @@ export function startFileGuard(
   observer.observe(document.body, { childList: true, subtree: true, characterData: true })
 
   return () => {
+    disposed = true
     document.removeEventListener('click', onClick, true)
     observer.disconnect()
     if (raf !== 0) cancelAnimationFrame(raf)

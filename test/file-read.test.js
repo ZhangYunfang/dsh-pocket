@@ -9,7 +9,7 @@ import { installPocketRpc } from '../lib/web-rpc.js';
 import { POCKET_ENDPOINTS } from '../client/api.js';
 
 /** 用 mock ctx 抓住注册进来的 RPC 处理函数。 */
-function makeCtx() {
+function makeCtx(extra = {}) {
   let handler = null;
   const ctx = {
     connection: {
@@ -17,6 +17,7 @@ function makeCtx() {
         handle: (_channel, fn) => { handler = fn; return () => {}; },
       },
     },
+    ...extra,
   };
   return { ctx, call: (endpoint, payload, signal) => handler(endpoint, payload, signal) };
 }
@@ -57,6 +58,43 @@ test('fileRead 相对路径按传入 cwd 解析', async () => {
   const res = await call(POCKET_ENDPOINTS.fileRead, { path: 'nested.txt', cwd: dir });
   assert.equal(res.ok, true, '相对路径应按传入 cwd 解析');
   assert.equal(res.value.content, 'cwd-resolved\n');
+});
+
+test('fileRead 相对路径优先按会话 header.cwd 解析（不是客户端猜的 cwd）', async () => {
+  // 多工作区：手机端 getWorkspaceCwd 只会拿到 workspaces.list 的第一项，
+  // 与当前会话无关。会话 id 是客户端真正知道的东西，主机按它查 header.cwd，
+  // 相对路径才会落在"这条消息所属项目"里。
+  const sessionDir = mkdtempSync(join(tmpdir(), 'pocket-fr-session-'));
+  const otherDir = mkdtempSync(join(tmpdir(), 'pocket-fr-other-'));
+  writeFileSync(join(sessionDir, 'same-name.txt'), 'from-session-cwd\n');
+  writeFileSync(join(otherDir, 'same-name.txt'), 'from-client-cwd\n');
+  const sessions = {
+    get: (id) => (id === 'sess-1' ? { header: { cwd: sessionDir } } : undefined),
+  };
+  const { ctx, call } = makeCtx({ get: (key) => (key === 'sessions' ? sessions : undefined) });
+  installPocketRpc(ctx, { service: { status: async () => ({}) } });
+  const res = await call(POCKET_ENDPOINTS.fileRead, {
+    path: 'same-name.txt',
+    cwd: otherDir, // 客户端猜错的 cwd：不该被采用
+    sessionId: 'sess-1',
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.value.content, 'from-session-cwd\n', '应读会话自己目录里的同名文件');
+});
+
+test('fileRead 会话查不到 cwd 时退回客户端 cwd', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pocket-fr-fallback-'));
+  writeFileSync(join(dir, 'only-here.txt'), 'fallback\n');
+  const sessions = { get: () => undefined };
+  const { ctx, call } = makeCtx({ get: (key) => (key === 'sessions' ? sessions : undefined) });
+  installPocketRpc(ctx, { service: { status: async () => ({}) } });
+  const res = await call(POCKET_ENDPOINTS.fileRead, {
+    path: 'only-here.txt',
+    cwd: dir,
+    sessionId: 'gone',
+  });
+  assert.equal(res.ok, true, '会话已删除/不在本进程时仍要能读');
+  assert.equal(res.value.content, 'fallback\n');
 });
 
 test('fileRead ~/ 展开为用户 HOME', async () => {

@@ -2,7 +2,8 @@
 //
 // 优先级：URL 参数 (?dsh-layout=desktop|mobile|auto) > localStorage > 默认 auto。
 //   - 参数值大小写不敏感（DESKTOP 与 desktop 等价）；
-//   - 'auto' 不写 localStorage，仅按 matchMedia 走；
+//   - 'auto' 是「跟随断点」的权威表达：不写 localStorage，且判定时不被旧存储值
+//     覆盖（写失败/私有模式下 removeItem 可能失败，见 resolveLayout）；
 //   - 显式 'desktop' / 'mobile' 同步到 localStorage，下次无 URL 参数也走同样布局；
 //   - 其它非法值（?dsh-layout=banana）：不生效也不清除已有存储（静默回退旧值），
 //     避免手滑拼写清掉用户的显式选择。
@@ -22,7 +23,13 @@ export function resolveLayout({ urlValue, stored, narrowMatch }) {
   const url = String(urlValue ?? '').trim().toLowerCase();
   if (url === 'desktop') return 'desktop';
   if (url === 'mobile') return 'mobile';
-  // 'auto' / 空 / 非法值 → 用 localStorage / matchMedia
+  // 显式 'auto' 是「跟随断点」的权威表达，必须绕开 localStorage。
+  // 只靠 persistLayoutFromUrl 的 removeItem + 读回来实现时，写失败（隐私模式、
+  // 配额、getter 抛错）会让读回值仍是旧强制值，于是 ?dsh-layout=auto 静默变成
+  // 强制布局——正是用户显式要求自动时最不该发生的结果。
+  if (url === 'auto') return narrowMatch ? 'mobile' : 'desktop';
+  // 无参数 / 空 / 非法值 → 用 localStorage / matchMedia
+  // （非法值不清存储，见文件头注释）
   if (stored === 'desktop' || stored === 'mobile') return stored;
   return narrowMatch ? 'mobile' : 'desktop';
 }

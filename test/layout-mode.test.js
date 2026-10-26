@@ -14,10 +14,20 @@ test('resolveLayout: URL mobile 优先于一切（含宽屏）', () => {
   assert.equal(resolveLayout({ urlValue: 'mobile', stored: 'desktop', narrowMatch: false }), 'mobile');
 });
 
-test('resolveLayout: URL auto / 空 → 退到 localStorage', () => {
-  assert.equal(resolveLayout({ urlValue: 'auto', stored: 'desktop', narrowMatch: true }), 'desktop');
+test('resolveLayout: 无 URL 参数 → 退到 localStorage', () => {
+  // issue #74 的持久化承诺：URL 上没有 dsh-layout 时，用户上次的显式选择生效。
+  assert.equal(resolveLayout({ urlValue: '', stored: 'desktop', narrowMatch: true }), 'desktop');
   assert.equal(resolveLayout({ urlValue: '', stored: 'mobile', narrowMatch: false }), 'mobile');
-  assert.equal(resolveLayout({ urlValue: 'auto', stored: 'invalid', narrowMatch: true }), 'mobile');
+  assert.equal(resolveLayout({ urlValue: 'garbage', stored: 'mobile', narrowMatch: false }), 'mobile');
+});
+
+test('resolveLayout: 显式 auto 是权威，不被残留 localStorage 覆盖', () => {
+  // persistLayoutFromUrl('auto') 的本意就是清掉强制值；但 removeItem 会失败
+  // （隐私模式/配额/getter 抛错），此时读回来仍是旧的 desktop/mobile。
+  // 若判定再退回存储值，用户显式要求的 auto 会静默变成"出不来"的强制布局。
+  assert.equal(resolveLayout({ urlValue: 'auto', stored: 'desktop', narrowMatch: true }), 'mobile');
+  assert.equal(resolveLayout({ urlValue: 'auto', stored: 'mobile', narrowMatch: false }), 'desktop');
+  assert.equal(resolveLayout({ urlValue: 'AUTO', stored: 'desktop', narrowMatch: true }), 'mobile');
 });
 
 test('resolveLayout: 都无 → 按 matchMedia 决定', () => {

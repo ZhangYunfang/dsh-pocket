@@ -386,7 +386,11 @@ export function mobileApply(ctx: ClientContext): void {
   // 事件）与强制 desktop（上方已早退）都不存在断点翻转，无需同步；语义与
   // layout-mode.mjs 的 resolveLayout 一致（auto 分支 = 跟随 narrowMatch）。
   const urlNorm = urlValue.trim().toLowerCase()
-  const layoutForced = urlNorm === 'desktop' || urlNorm === 'mobile' || stored === 'desktop' || stored === 'mobile'
+  // 显式 ?dsh-layout=auto 是「跟随断点」的权威表达：此时即使 localStorage 里还留着
+  // 旧的强制值（persistLayoutFromUrl 的 removeItem 可能因隐私模式/配额失败），
+  // 生效布局仍是 auto，断点同步必须照挂——否则旋转屏幕后门控 CSS 会失准。
+  const layoutForced = urlNorm === 'desktop' || urlNorm === 'mobile'
+    || (urlNorm !== 'auto' && (stored === 'desktop' || stored === 'mobile'))
   if (!layoutForced) {
     ctx.effect(() => {
       const syncLayoutAttr = (): void => {
@@ -543,15 +547,14 @@ export function mobileApply(ctx: ClientContext): void {
   //    gesturestart/gesturechange 一律 preventDefault，等于焊死了上游 #45 刻意
   //    留下的逃生口——iOS 对 <16px 输入框聚焦会自动放大 viewport，放大之后唯一
   //    的用户侧还原手段就是捏合缩小；standalone（添加到主屏幕）模式没有地址栏、
-  //    没有刷新按钮，放大锁死即死锁。权衡后的语义：**只拦放大、永远放行缩小**——
+  //    没有刷新按钮，放大锁死即死锁。语义：**只拦放大，缩小永远放行**。
   //    gesturestart 记 startScale = visualViewport.scale（手势起点的页面缩放级别），
-  //    gesturechange 里 startScale * event.scale <= startScale（event.scale 是相对
-  //    手势起点的比例，乘积即本次手势的落点缩放；<= 起点即缩小方向）→ 不
-  //    preventDefault 放行，否则 preventDefault。效果：无论页面处于哪个缩放级别
-  //    （含被浏览器自动放大后），捏合缩小永远可用（逃生口保住）；从 1x 出发的
-  //    捏合放大仍被禁（2026-09-14 诉求的本体）。gestureend 清起点。
-  //    visualViewport 缺失（罕见）→ startScale 记 0 → 全拦退回旧行为：宁可过严，
-  //    也不制造还原不了的放大。
+  //    gesturechange 里 event.scale 是相对手势起点的比例，乘积即本次手势的落点缩放；
+  //    <= 起点即缩小方向 → 不 preventDefault。开关打开时从任何级别出发的放大都放行；
+  //    开关关闭（默认）时 1x 起点的放大仍全拦（2026-09-14 诉求的本体），但页面
+  //    一旦已被浏览器放大（>1x），缩小方向仍然放行——那是逃生口，不是「放大」。
+  //    gestureend 清起点。visualViewport 缺失（罕见）→ startScale 记 0 → 全拦
+  //    退回旧行为：宁可过严，也不制造还原不了的放大。
   //  - Android 端上游刻意保留捏合（VIEWPORT_CONTENT 不写 zoom 令牌），遵循其
   //    决定，不与其 observer 对打。
   //  M8：随 narrowMQ change 动态装卸，旋转跨断点即时生效。
@@ -562,17 +565,23 @@ export function mobileApply(ctx: ClientContext): void {
       startScale = window.visualViewport?.scale ?? 0
     }
     const onChange = (event: Event): void => {
-      // 设置页开启捏合（body 属性非 "off"）→ 维持条件拦截；关闭（默认，
-      // 属性为 "off" 或拉取失败前缺失）→ 双向全拦：放大缩小都 preventDefault，
-      // 页面锁死 1x。手势事件低频，直接读属性即可，无需向设置层订阅。
+      const gestureScale = (event as Event & { scale: number }).scale
+      // 手势相对起点的比例 <1 即缩小方向；非数（异常事件）一律不当缩小处理。
+      const shrinking = typeof gestureScale === 'number' && Number.isFinite(gestureScale) && gestureScale < 1
+      // 关键：把「还原」和「放大」分开处理。
+      // 关闭捏合（默认）时原实现是双向全拦，页面锁死——但 iOS 对 <16px 输入框
+      // 聚焦会自动放大 viewport，这条放大不经手势、拦不到；standalone（添加到
+      // 主屏幕）又没有地址栏和刷新按钮，于是用户被锁在一个放大且不可用的页面上。
+      // 现在无论开关状态，只要手势起点已经大于 1x，缩小方向一律放行：
+      // 禁的始终是「放大」，从不没收唯一的还原手段。
       if (document.body?.getAttribute(MOBILE_PINCH_ZOOM_ATTRIBUTE) !== 'on') {
+        if (startScale > 1.0001 && shrinking) return
         event.preventDefault()
         return
       }
-      const scale = (event as Event & { scale: number }).scale
       // startScale<=0（vv 缺失）或 scale 为非数（异常事件，NaN 比较为 false）都
       // 落入 preventDefault——fail closed，等价旧的全拦行为。
-      if (startScale > 0 && startScale * scale <= startScale) return
+      if (startScale > 0 && startScale * gestureScale <= startScale) return
       event.preventDefault()
     }
     const onEnd = (): void => { startScale = 0 }
@@ -583,6 +592,89 @@ export function mobileApply(ctx: ClientContext): void {
       document.removeEventListener('gesturestart', onStart)
       document.removeEventListener('gesturechange', onChange)
       document.removeEventListener('gestureend', onEnd)
+    }
+  })
+
+  // 弹层键盘可达性（a11y，pocket 侧补丁）：上游自建的弹层（删除确认、错误卡、
+  // 附件选择 sheet）都带 role="dialog" aria-modal="true"，但只做了 Escape 关闭，
+  // 没有焦点约束——手机外接键盘/桌面强制 mobile 布局时，Tab 会走到弹层背后的
+  // 会话列表上，"模态"对键盘用户不成立；关闭后焦点也不会回到触发按钮。
+  // 只接管 pocket 自己注入的弹层（data-mobile-nav 标记），宿主自己的 dialog 不动。
+  armOnNarrow('dsh-pocket: dialog focus containment', () => {
+    const DIALOG = '[role="dialog"][aria-modal="true"]'
+    const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    const triggerStack: HTMLElement[] = []
+    const isOurs = (el: Element): boolean =>
+      el.hasAttribute('data-mobile-nav') || el.parentElement?.hasAttribute('data-mobile-nav') === true
+    const focusables = (node: Element): HTMLElement[] =>
+      Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE))
+        .filter((el) => el.getClientRects().length > 0)
+    let active: HTMLElement | null = null
+
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (active === null || !active.isConnected) return
+      if (event.key !== 'Tab') return
+      const list = focusables(active)
+      if (list.length === 0) {
+        // 没有可聚焦子元素：把焦点钉在弹层本身，Tab 不再逃逸到背景。
+        event.preventDefault()
+        if (document.activeElement !== active) active.focus({ preventScroll: true })
+        return
+      }
+      const first = list[0]
+      const last = list[list.length - 1]
+      const current = document.activeElement as HTMLElement | null
+      if (event.shiftKey && (current === first || !active.contains(current))) {
+        event.preventDefault()
+        last.focus({ preventScroll: true })
+      } else if (!event.shiftKey && (current === last || !active.contains(current))) {
+        event.preventDefault()
+        first.focus({ preventScroll: true })
+      }
+    }
+    document.addEventListener('keydown', onKeyDown, true)
+
+    // 弹层出现/消失都从 DOM 突变看：上游用 innerHTML + append 建卡片，没有可挂的
+    // 生命周期回调。只在真正换了弹层对象时才动焦点，避免每次突变都抢焦点。
+    const sync = (): void => {
+      const dialog = Array.from(document.querySelectorAll<HTMLElement>(DIALOG)).find(isOurs) ?? null
+      if (dialog === active) return
+      if (active !== null) {
+        // 弹层关闭：焦点还给触发它的那个按钮（它可能也已经被卸载）。
+        const back = triggerStack.pop()
+        active = null
+        if (back !== undefined && back.isConnected) back.focus({ preventScroll: true })
+        return
+      }
+      active = dialog
+      if (dialog === null) return
+      const opener = document.activeElement as HTMLElement | null
+      if (opener !== null && opener !== document.body && !dialog.contains(opener)) triggerStack.push(opener)
+      // 弹层自身需要 tabindex 才能成为无子元素时的焦点锚。
+      if (!dialog.hasAttribute('tabindex')) dialog.setAttribute('tabindex', '-1')
+      const list = focusables(dialog)
+      ;(list[0] ?? dialog).focus({ preventScroll: true })
+    }
+    let raf = 0
+    const schedule = (): void => { if (raf === 0) raf = requestAnimationFrame(() => { raf = 0; sync() }) }
+    sync()
+    const observer = new MutationObserver((mutations) => {
+      // 输入法/流式输出会持续改 characterData 与文本节点，那些与弹层无关。
+      for (const m of mutations) {
+        if (m.type !== 'childList') continue
+        for (const n of m.addedNodes) { if (n.nodeType === 1) { schedule(); return } }
+        for (const n of m.removedNodes) { if (n.nodeType === 1) { schedule(); return } }
+      }
+    })
+    observer.observe(document.body, { childList: true, subtree: true })
+    return () => {
+      document.removeEventListener('keydown', onKeyDown, true)
+      observer.disconnect()
+      if (raf !== 0) cancelAnimationFrame(raf)
+      // 卸载时弹层还在（切布局）：移除我们加的 tabindex，别留 pocket 痕迹。
+      active?.removeAttribute('tabindex')
+      active = null
+      triggerStack.length = 0
     }
   })
 
@@ -852,8 +944,31 @@ export function mobileApply(ctx: ClientContext): void {
   // 的 t()——词典键在 pocket-locales.js（NS='pocket'），从 ctx.locale 绑定后经
   // startFileGuard 入参传入（bind 惰性取词，注册顺序在后也不影响）。
   armOnNarrow('dsh-pocket: file open guard + copy button + hide add-workspace (issue #17)', () => {
+    // 当前会话 id：主机侧优先用它把相对路径解析到「这条消息所属项目」的目录。
+    // 客户端只知道会话 id，不知道会话的 cwd；因此 cwd 由主机按 id 查，客户端
+    // 传的 cwd 只作最后兜底（多工作区下它永远是第一个工作区，是错的来源）。
+    const currentSessionId = (): string | undefined => {
+      try {
+        const list = (ctx as unknown as {
+          sessions?: { list?: { getSnapshot?: () => unknown } }
+        }).sessions?.list?.getSnapshot?.() as {
+          current?: unknown
+          byId?: Record<string, { id?: unknown; retainedBy?: { mainView?: unknown } }>
+        } | undefined
+        if (list === null || typeof list !== 'object') return undefined
+        if (typeof list.current === 'string') return list.current
+        for (const key in list.byId) {
+          const summary = list.byId[key]
+          if (summary === undefined) continue
+          const mainView = summary.retainedBy?.mainView
+          if (typeof mainView === 'number' && mainView > 0 && typeof summary.id === 'string') return summary.id
+        }
+      } catch { /* 服务形状不同（a2/rc 代际差异）→ 不给 sessionId，主机退回旧逻辑 */ }
+      return undefined
+    }
     // 尽量拿到当前工作区 cwd（文件链接文案是相对它的），传给主机 RPC 做精确解析；
     // 拿不到就回退到主机 process.cwd()。dsh-web 的 workspaces 服务暴露当前工作区。
+    // 注意这只是兜底：真正权威的来源是 sessionId → header.cwd（主机侧解析）。
     const getWorkspaceCwd = (): string => {
       try {
         const ws = (ctx as unknown as { get?: (k: string) => unknown }).get?.('workspaces')
@@ -875,12 +990,18 @@ export function mobileApply(ctx: ClientContext): void {
       return ''
     }
     // 手机侧读文件回调：走 dsh-pocket 的 RPC 通道，由主机侧 fileRead 端点处理。
-    const readFile = (filePath: string) =>
-      ctx.connection.rpc.call(
+    const readFile = (filePath: string) => {
+      const sessionId = currentSessionId()
+      return ctx.connection.rpc.call(
         POCKET_RPC_CHANNEL,
         POCKET_ENDPOINTS.fileRead,
-        { path: filePath, cwd: getWorkspaceCwd() },
+        {
+          path: filePath,
+          cwd: getWorkspaceCwd(),
+          ...(sessionId === undefined ? {} : { sessionId }),
+        },
       ) as Promise<{ ok: boolean; value?: { content: string; path: string; size: number }; error?: { message: string } }>
+    }
     // H4：词典取词——上游 session-menu.ts 同款 ctx.locale.bind 用法；cast 成
     // 简单签名后交给 startFileGuard。
     const fileGuardT = ctx.locale.bind(POCKET_NS) as (key: string) => string

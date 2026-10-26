@@ -1463,6 +1463,25 @@ test('?token=<原始 PIN> 直达种 HttpOnly cookie，issue #35', async () => {
     });
     assert.equal(r4.status, 200, '错误密码走登录页（200）');
     assert.ok(!String(r4.setCookie ?? '').includes('dsh_pocket_token'), '错误密码不种 cookie');
+
+    // 5) 浏览器带着上一进程的失效 cookie（sessionKey 已换）再走 ?token=：
+    //    必须换发新 cookie，否则壳能过、子资源全 401，用户只能手清 cookie。
+    const staleReq = () => new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1', port: proxy.port, path: `/?token=${TOKEN}`,
+        headers: { Host: 'x:3081', Accept: 'text/html', Cookie: 'dsh_pocket_token=deadbeefdeadbeef' },
+      }, (res) => {
+        res.resume();
+        res.on('end', () => {
+          const raw = Array.isArray(res.headers['set-cookie']) ? res.headers['set-cookie'].join(';') : String(res.headers['set-cookie'] ?? '');
+          resolve({ status: res.statusCode, setCookie: raw });
+        });
+      });
+      req.on('error', reject); req.end();
+    });
+    const r5 = await staleReq();
+    assert.ok(r5.setCookie.includes(`dsh_pocket_token=${hashed}`),
+      `失效 cookie 必须被换发（实得：${r5.setCookie.slice(0, 200)}）`);
   } finally {
     await proxy.close();
     await new Promise((r) => up.close(r));
@@ -1633,6 +1652,138 @@ test('accept-encoding 的 q 值被尊重：br;q=0 视为不支持 brotli（P1-3�
     const res = await rawGet(proxy.port, '/plugins/??a/client.js&rev=12e24962dfd7', { 'accept-encoding': 'br;q=0, gzip' });
     assert.equal(res.headers['content-encoding'], 'gzip', 'q=0 不选 br，原样透传 gzip');
     assert.equal(res.body.length, gz.length, '字节原样');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+// ---------- 取消传播（下游断开必须传到上游） ----------
+
+/**
+ * 「响应头已发、body 永远不结束」的上游，记录上游连接何时被关。
+ *
+ * 这是审查里复现「取消不传播」的形状：代理的 403 门禁改写、HTML 注入、session/list
+ * 瘦身、不可变资源缓存回填都要先把上游 body 收完才写响应，客户端在此期间离开时
+ * 上游必须跟着停，否则 cloudflared 出站通道被白占到写完。
+ */
+async function hangingUpstream(status, headers, firstChunk) {
+  const state = { reqClosed: false };
+  const server = createServer((req, res) => {
+    req.socket.on('close', () => { state.reqClosed = true; });
+    res.writeHead(status, headers);
+    if (firstChunk) res.write(firstChunk);
+    // 不 end()：模拟上游持续生成
+  });
+  server.on('connection', (s) => { s.on('close', () => { state.reqClosed = true; }); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return { port: server.address().port, server, state };
+}
+
+/**
+ * 发请求、等 200ms 让代理把上游请求建立起来，然后直接销毁客户端 socket。
+ * 不能用 http.request 的响应事件：注入/门禁分支在收到上游 body 结束前一个字节都不写，
+ * 等 data 会一直挂到超时。裸 socket 才能表达「用户就这么把页面关了」。
+ */
+function disconnectAfterMs(port, path, headers, ms = 200) {
+  return new Promise((resolve, reject) => {
+    const sock = connect(port, '127.0.0.1', () => {
+      const head = [`GET ${path} HTTP/1.1`, 'Host: 127.0.0.1'];
+      for (const [k, v] of Object.entries(headers)) head.push(`${k}: ${v}`);
+      sock.write(head.join('\r\n') + '\r\n\r\n');
+      setTimeout(() => { sock.destroy(); resolve(); }, ms);
+    });
+    sock.on('error', () => resolve()); // 主动销毁后可能 ECONNRESET
+    setTimeout(() => reject(new Error('连接没有建立')), 3000);
+  });
+}
+
+test('取消传播：客户端断开 → 上游请求被销毁（HTML 注入缓冲分支）', async () => {
+  const up = await hangingUpstream(200, { 'content-type': 'text/html; charset=utf-8' }, '<html><head></head>');
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1', upstream: { host: '127.0.0.1', port: up.port },
+    injectHtml: DEFAULT_INJECT,
+  });
+  try {
+    await disconnectAfterMs(proxy.port, '/', { accept: 'text/html' });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(up.state.reqClosed, true, '客户端断开后上游连接必须被销毁，不能继续等整段 body');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.server.close(r));
+  }
+});
+
+test('取消传播：客户端断开 → 上游请求被销毁（403 门禁缓冲分支）', async () => {
+  const up = await hangingUpstream(403, { 'content-type': 'text/plain; charset=utf-8' }, 'forbid');
+  const proxy = await createPocketProxy({ port: 0, host: '127.0.0.1', upstream: { host: '127.0.0.1', port: up.port } });
+  try {
+    await disconnectAfterMs(proxy.port, '/', { accept: 'text/html' });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(up.state.reqClosed, true, '403 缓冲分支同样要传递取消');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.server.close(r));
+  }
+});
+
+test('取消传播：客户端断开 → 上游请求被销毁（WS 握手阶段，101 之前）', async () => {
+  // 上游只回 101 的头但不接管——太麻烦；这里用「上游对 upgrade 不响应」的形状：
+  // 代理的 proxyReq 会一直等，客户端断开后必须销毁它。
+  let upReqClosed = false;
+  const up = createServer(() => { /* 普通请求不回，模拟卡住 */ });
+  up.on('connection', (s) => { s.on('close', () => { upReqClosed = true; }); });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({ port: 0, host: '127.0.0.1', upstream: { host: '127.0.0.1', port: up.address().port } });
+  try {
+    await disconnectAfterMs(proxy.port, '/api/events', {
+      connection: 'Upgrade', upgrade: 'websocket',
+      'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'sec-websocket-version': '13',
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(upReqClosed, true, '握手未完成时客户端断开，上游连接不能一直挂着');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+test('Range 请求：206 分片响应不得被代理压缩（否则浏览器解码失败）', async () => {
+  // 回归背景：代理对所有 text/* 与 JSON 统一套 Content-Encoding。上游回 206
+  // 时 body 只是整文件的一段，加了编码头浏览器会拿这一段当独立压缩流解，
+  // 直接 ERR_CONTENT_DECODING_FAILED；且 Content-Range 描述的是未压缩字节。
+  const full = Buffer.from('0123456789'.repeat(2000), 'utf8'); // 20KB 可压缩文本
+  const up = createServer((req, res) => {
+    const m = /bytes=(\d+)-(\d+)/.exec(String(req.headers.range ?? ''));
+    if (m) {
+      const start = Number(m[1]);
+      const end = Number(m[2]);
+      const slice = full.subarray(start, end + 1);
+      res.writeHead(206, {
+        'content-type': 'text/plain; charset=utf-8',
+        'content-range': `bytes ${start}-${end}/${full.length}`,
+        'content-length': String(slice.length),
+        'accept-ranges': 'bytes',
+      });
+      res.end(slice);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'content-length': String(full.length) });
+    res.end(full);
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({ port: 0, host: '127.0.0.1', upstream: { host: '127.0.0.1', port: up.address().port } });
+  try {
+    const part = await rawGet(proxy.port, '/big.txt', { Range: 'bytes=100-199', 'accept-encoding': 'gzip, br' });
+    assert.equal(part.status, 206, '状态码保持 206');
+    assert.equal(part.headers['content-encoding'], undefined, '206 不得被压缩');
+    assert.equal(part.headers['content-range'], `bytes 100-199/${full.length}`, 'Content-Range 原样透传');
+    assert.ok(part.body.equals(full.subarray(100, 200)), '分片字节必须原样');
+
+    // 普通 200 仍需压缩（不能被这条规则误伤）
+    const whole = await rawGet(proxy.port, '/big.txt', { 'accept-encoding': 'gzip' });
+    assert.equal(whole.status, 200);
+    assert.equal(whole.headers['content-encoding'], 'gzip', '200 仍照常压缩');
   } finally {
     await proxy.close();
     await new Promise((r) => up.close(r));

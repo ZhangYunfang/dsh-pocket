@@ -330,3 +330,70 @@ test('转码缓存：不可变资产第二次请求不再回源，普通路径�
     await new Promise((r) => up.close(r));
   }
 });
+
+test('删除事务：payload 改名中途失败 → 已改名的回滚，会话重新对宿主可见', async () => {
+  // 回归背景：老实现先逐个把 session*.jsonl 改成 .trash（宿主扫描立刻看不到），
+  // 再整体 rename 目录进回收站。中途失败（权限/占用/ENAMETOOLONG）时没有回滚，
+  // 结果会话既不在原位可见、也没进回收站 —— 删除报错却说"没删成功"。
+  const root = mkdtempSync(join(tmpdir(), 'pocket-del-'));
+  const cwd = join(root, 'proj');
+  const id = 'sess-midway-fail';
+  // 目录布局与后端一致：<root>/<projectKey>/<sessionId>/
+  const { deleteSession } = await import('../lib/delete-session.mjs');
+  const persistence = {
+    config: { root },
+    list: async () => [{ id, cwd: 'C:\work\proj' }],
+  };
+  // 用 persistence.list 给出的 cwd 反推真实目录，再把它造出来
+  const snapshotCwd = 'C:\work\proj';
+  const dirs = await import('node:fs');
+  const path = await import('node:path');
+  const projectDir = path.join(root, (() => {
+    // 与 lib 的 projectKey 同规则：分隔符折叠成 '-'，前缀/后缀 '--'
+    const slug = snapshotCwd.replace(/[/\:]+/g, '-').replace(/^-+/, '');
+    return `--${slug.slice(0, 251)}--`;
+  })());
+  const sessionPath = path.join(projectDir, id);
+  dirs.mkdirSync(sessionPath, { recursive: true });
+  dirs.writeFileSync(path.join(sessionPath, 'session.jsonl'), '{"type":"session"}\n');
+  dirs.writeFileSync(path.join(sessionPath, 'session.v2.jsonl'), '{"type":"session"}\n');
+  // 第二个 payload 的 .trash 目标先占成目录 → 那次 rename 必然失败（模拟半途出错）
+  dirs.mkdirSync(path.join(sessionPath, 'session.v2.jsonl.trash'));
+
+  const res = await deleteSession({ persistence }, id);
+  assert.equal(res.ok, false, '应当报删除失败');
+  assert.equal(dirs.existsSync(path.join(sessionPath, 'session.jsonl')), true,
+    '已改名的 payload 必须回滚成原名，会话重新可见');
+  assert.equal(dirs.existsSync(path.join(sessionPath, 'session.v2.jsonl')), true,
+    '失败的那一项原名也不动，两个 payload 都还在原位');
+  assert.equal(dirs.existsSync(path.join(sessionPath, 'session.jsonl.trash')), false,
+    '已改名的 payload 不得留下 .trash 残骸');
+  assert.equal(dirs.existsSync(path.join(root, '.sessions-trash')), false,
+    '失败时不得留下空的回收站目录');
+  dirs.rmSync(root, { recursive: true, force: true });
+});
+
+test('删除事务：目录整体搬迁失败 → payload 名字复原，且不进回收站', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pocket-del2-'));
+  const { deleteSession } = await import('../lib/delete-session.mjs');
+  const id = 'sess-stash-fail';
+  const snapshotCwd = 'C:\work\proj2';
+  const dirs = await import('node:fs');
+  const path = await import('node:path');
+  const slug = snapshotCwd.replace(/[/\:]+/g, '-').replace(/^-+/, '');
+  const sessionPath = path.join(root, `--${slug.slice(0, 251)}--`, id);
+  dirs.mkdirSync(sessionPath, { recursive: true });
+  dirs.writeFileSync(path.join(sessionPath, 'session.jsonl'), '{"type":"session"}\n');
+  // 让 .sessions-trash 变成一个普通文件：mkdir/rename 都会失败
+  dirs.writeFileSync(path.join(root, '.sessions-trash'), 'not-a-directory');
+
+  const res = await deleteSession({
+    persistence: { config: { root }, list: async () => [{ id, cwd: snapshotCwd }] },
+  }, id);
+  assert.equal(res.ok, false, '搬迁失败应报错');
+  assert.equal(dirs.existsSync(path.join(sessionPath, 'session.jsonl')), true,
+    'payload 必须复原：报错之后会话不能凭空消失');
+  assert.equal(dirs.existsSync(path.join(sessionPath, 'session.jsonl.trash')), false,
+    '不得留下 .trash 残骸');
+  dirs.rmSync(root, { recursive: true, force: true });
+});

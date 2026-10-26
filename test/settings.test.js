@@ -345,3 +345,43 @@ test('手机端独立字号：默认跟随桌面（0）、可设可清、非法�
   assert.throws(() => setMobileFontSize(15.5), (err) => err instanceof Error, '小数抛错');
   assert.throws(() => setMobileFontSize('garbage'), (err) => err instanceof Error, '非数字抛错');
 }));
+
+test('PIN 落盘失败：内存值仍可用，但 pinWriteWarning 必须暴露「重启会变」', () => withHome(async (home) => {
+  // 回归背景：writePinToFile 的写盘异常只打 warn，setCustomPin 照旧返回成功，
+  // 设置页据此显示「已保存」。用户重启后 PIN 变回旧值（甚至随机新值）→ 登不上。
+  const { mkdirSync: mk, writeFileSync: wf } = await import('node:fs');
+  const { pinWriteWarning, setCustomPin, getAccessToken } = await import('../lib/index.js');
+  // 让 PIN 文件路径变成目录：writeFileSync 必失败（EISDIR/EPERM）
+  const pinDir = join(home, 'dsh-pocket');
+  mk(pinDir, { recursive: true });
+  // 先用正常写入建立基线
+  assert.equal(setCustomPin('public', 'firstPin1'), 'firstPin1');
+  assert.equal(pinWriteWarning('public'), null, '正常写入没有告警');
+
+  // 把 token 文件换成同名目录，模拟「磁盘写不进去」
+  // 路径与 lib/index.js 的 tokenPath() 一致：<DSH_HOME>/dsh-pocket/token
+  const p = join(pinDir, 'token');
+  const { rmSync: rm } = await import('node:fs');
+  rm(p, { force: true });
+  mk(p, { recursive: true });
+
+  const memoryPin = setCustomPin('public', 'secondPin2');
+  assert.equal(memoryPin, 'secondPin2', '内存值仍然立刻生效');
+  assert.equal(getAccessToken(), 'secondPin2', '读取走内存');
+  const warning = pinWriteWarning('public');
+  assert.ok(typeof warning === 'string' && warning.length > 0, '必须报告落盘失败原因');
+}));
+
+test('恢复出厂：设置文件删不掉时 resetPocketState 报 settingsCleared=false 并带告警', () => withHome(async (home) => {
+  const { resetPocketState } = await import('../lib/index.js');
+  const { settingsPath } = await import('../lib/settings.mjs');
+  const { mkdirSync: mk, rmSync: rm } = await import('node:fs');
+  // 让 settings.json 变成非空目录：rmSync(force) 删文件成功、删非空目录失败
+  const sp = settingsPath();
+  rm(sp, { force: true });
+  mk(join(sp, 'blocker'), { recursive: true });
+  const out = resetPocketState();
+  assert.equal(out.settingsCleared, false, '删除失败必须如实上报，不能吞掉');
+  assert.ok(out.warnings.some((w) => w.includes('settings.json')), '告警里要说明是设置文件没删掉');
+  assert.ok(out.accessToken.length >= 8, 'PIN 仍然换成新的（内存可用）');
+}));

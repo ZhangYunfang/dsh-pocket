@@ -272,6 +272,7 @@ function PocketSettingsTab({ rpcCall, t }) {
   const [offline, setOffline] = useState(false); // 连续拉不到 status：宿主可能正在重启
   const failuresRef = useRef(0); // 连续失败次数（不进 state，避免每次失败都重渲染）
   const mutatedAtRef = useRef(0); // 最近一次本地修改时间：用于丢弃比本地状态更旧的 status 快照
+  const loadSeqRef = useRef(0); // load 调用序号：只有最后发起的那次能提交快照（防乱序覆盖）
 
   // status 首帧还没回来时，setStatus((s) => ({ ...s, ... })) 会把 null 展开成 {}
   // —— 界面字段短暂变 undefined。统一走这里：没数据就丢弃这次局部更新，
@@ -343,8 +344,14 @@ function PocketSettingsTab({ rpcCall, t }) {
 
   const load = async () => {
     const startedAt = Date.now();
+    // 并发快照的先后顺序：轮询（10s）与 visibilitychange 都会触发 load，经隧道
+    // 时一次 /status 可能拖到十几秒，于是「先发的慢请求」晚于「后发的快请求」
+    // 落地，用更旧的快照盖掉新状态（隧道进度条倒退、开关回弹）。只有最后发起
+    // 的那次 load 允许提交结果；被判过期的这次直接丢弃。
+    const seq = ++loadSeqRef.current;
     try {
       const s = await call(POCKET_ENDPOINTS.status, {});
+      if (seq !== loadSeqRef.current) return;
       // 拉取期间用户刚改过设置：这份快照可能比本地状态旧，丢掉，否则会把刚切的开关弹回去
       if (mutatedAtRef.current > startedAt) { setOffline(false); failuresRef.current = 0; return; }
       failuresRef.current = 0;
@@ -366,6 +373,9 @@ function PocketSettingsTab({ rpcCall, t }) {
         }
       }
     } catch {
+      // 过期的失败不该计入连续失败：另一条更新的 load 已经成功的话，这里加一
+      // 会让「offline」横幅在宿主明明正常时亮起来。
+      if (seq !== loadSeqRef.current) return;
       // 宿主重启/网络抖动时静默重试；连续失败 2 次才提示，避免一次抖动就报错
       failuresRef.current += 1;
       if (failuresRef.current >= 2) setOffline(true);
@@ -382,6 +392,8 @@ function PocketSettingsTab({ rpcCall, t }) {
     return () => {
       clearInterval(t);
       document.removeEventListener('visibilitychange', onVisible);
+      // 卸载后迟到的响应一律作废（否则会 setState 到已卸载组件上）
+      loadSeqRef.current += 1;
     };
   }, []);
 
@@ -552,7 +564,14 @@ function PocketSettingsTab({ rpcCall, t }) {
         setCustomPin(null);
         setAdvOpen(false);
         setPinShown({});
-        showToast(t('resetDone'));
+        // 重置可能不完整（设置文件删不掉 / 新 PIN 只落内存）：说清楚，
+        // 否则用户以为回到了出厂，实际开关和密码还是旧的。
+        if (Array.isArray(next?.resetWarnings) && next.resetWarnings.length > 0) {
+          setError(next.resetWarnings.join('；'));
+          showToast(t('resetPartial'));
+        } else {
+          showToast(t('resetDone'));
+        }
       } catch (err) {
         setError(err.message);
         showToast(t('resetFailed'));
@@ -661,6 +680,11 @@ function PocketSettingsTab({ rpcCall, t }) {
         lanPinCustom: which === 'lan' ? true : s.lanPinCustom,
       } : s));
       setCustomPin(null);
+      // 写入磁盘失败时后端仍返回内存 PIN（本次运行有效），但重启后会失效。
+      // 不提示的话用户以为改好了，重启后再也登不上。
+      if (r && r.persisted === false) {
+        showToast(t('pinSaveMemoryOnly'));
+      }
     } catch (err) {
       setCustomPin((c) => ({ ...(c ?? {}), err: err.message }));
     }

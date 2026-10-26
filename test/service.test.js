@@ -1329,3 +1329,110 @@ test('startTunnel 同步抛错后不残留 rejected 的 in-flight（TDZ 回归�
   assert.equal((await service.status()).tunnelRunning, true, '隧道确实起来了');
   await service.dispose();
 });
+
+test('生命周期：startProxy 在途时 dispose → 建好的代理立即关闭，端口不留孤儿', async () => {
+  // 回归背景：createProxy 是 await 的，dispose() 只看得到当时的 `proxy === null`，
+  // 于是那次在途启动落地后仍会被赋给 proxy，闭包里的 server 已随插件卸载无人关闭
+  // → 端口一直被占，直到进程退出。修法是卸载世代号 + 落地后二次校验。
+  let releaseCreate;
+  const gate = new Promise((resolve) => { releaseCreate = resolve; });
+  const created = [];
+  const service = createPocketService({
+    dshPort: 3080,
+    port: 3081,
+    internals: {
+      ...stubInternals(),
+      createProxy: async ({ port }) => {
+        await gate;
+        const server = { port, closed: 0, close: async () => { server.closed += 1; } };
+        created.push(server);
+        return server;
+      },
+    },
+  });
+
+  const pending = service.startProxy();
+  const disposing = service.dispose();
+  releaseCreate();
+
+  await assert.rejects(() => pending, /disposed/, '在途启动应拒绝，不返回过期代理');
+  await disposing;
+  assert.equal(created.length, 1, '代理确实被创建过（证明走了 await 之后的落地路径）');
+  assert.equal(created[0].closed, 1, '过期落地必须自行关闭 server');
+  assert.equal((await service.status()).proxyRunning, false, '状态不应把过期代理念成运行中');
+});
+
+test('生命周期：dispose 之后再 startProxy / startTunnel 都拒绝', async () => {
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals: stubInternals() });
+  await service.dispose();
+  await assert.rejects(() => service.startProxy(), /disposed/);
+  await assert.rejects(() => service.startTunnel(), /disposed/);
+  assert.equal((await service.status()).proxyRunning, false);
+  assert.equal((await service.status()).tunnelRunning, false);
+});
+
+test('生命周期：startProxy 在途时 stopTunnel → 隧道不再 spawn cloudflared', async () => {
+  // 回归背景：startTunnel 原来是 `await this.startProxy()` 之后才建 AbortController，
+  // 所以代理启动窗口内调用 stopTunnel 看不到这次在途启动，等它拿到代理后照样
+  // spawn 出 cloudflared，用户以为已关闭的公网仍在运行。
+  let releaseCreate;
+  const gate = new Promise((resolve) => { releaseCreate = resolve; });
+  let startNamedCount = 0;
+  const service = createPocketService({
+    dshPort: 3080,
+    port: 3081,
+    getTunnelConfig: namedTunnelConfig,
+    internals: {
+      ...stubInternals(),
+      createProxy: async ({ port }) => {
+        await gate;
+        return { port, close: async () => {} };
+      },
+      startNamedTunnel: async () => {
+        startNamedCount += 1;
+        return { url: null, kill: () => {} };
+      },
+    },
+  });
+
+  const pending = service.startTunnel();
+  service.stopTunnel();
+  releaseCreate();
+
+  await assert.rejects(() => pending, /aborted/);
+  assert.equal(startNamedCount, 0, '已取消的启动不得 spawn cloudflared');
+  assert.equal((await service.status()).tunnelRunning, false);
+  await service.dispose();
+});
+
+test('生命周期：旧隧道 onExit 迟到触发不抹掉新隧道状态', async () => {
+  let exitA;
+  let startNamedCount = 0;
+  const service = createPocketService({
+    dshPort: 3080,
+    port: 3081,
+    getTunnelConfig: namedTunnelConfig,
+    internals: {
+      ...stubInternals(),
+      startNamedTunnel: async () => {
+        startNamedCount += 1;
+        const mine = startNamedCount;
+        return {
+          url: null,
+          kill: () => {},
+          onExit: mine === 1 ? (cb) => { exitA = cb; } : () => {},
+        };
+      },
+    },
+  });
+  await service.startTunnel();
+  service.stopTunnel();
+  await service.startTunnel();
+  assert.equal((await service.status()).tunnelRunning, true, '新隧道已就绪');
+
+  exitA?.(1); // 上一代进程的退出通知迟到
+  const after = await service.status();
+  assert.equal(after.tunnelRunning, true, '迟到回调不得清掉当前隧道引用');
+  assert.equal(after.tunnelState.phase, 'ready', '状态也不该被打成 error');
+  await service.dispose();
+});
