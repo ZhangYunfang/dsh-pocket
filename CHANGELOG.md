@@ -1,3 +1,21 @@
+## [3.0.6](https://github.com/daha1216/dsh-pocket/compare/v3.0.5...v3.0.6) (2026-10-27)
+
+> 第四轮对抗验证（settings 生命周期 / PIN 缓存 / pnpm 安装布局）后的补丁，完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。
+
+### Security
+
+* **settings:** 恢复出厂改为「持锁 + 墓碑回滚」：先把 `settings.json` 改名成墓碑、删完全部派生文件后才丢弃；任一派生文件（`.bak`/`.tmp`，可能含 `tunnelToken`）删不掉就回滚主文件并返回失败。旧实现吞掉删除错误仍报成功，主文件缺失时新加的 `.bak` 回退会让旧配置整份复活，恢复出厂形同虚设
+* **settings:** 恢复出厂拿不到锁（另一进程正在写）时直接返回失败，不再等 750ms 后无锁执行——否则另一进程随后整份写回，同样变成「提示成功、实际撤销」
+
+### Bug Fixes
+
+* **index:** PIN 写盘失败后障碍解除会自动补写（每秒最多试一次），不再出现「设置页显示 PIN-A、重启后变 PIN-B、用户按页面上的值登录被拒」；Windows 同 tick 改写按内容判定，不再因 mtime 相同而认旧值
+* **index:** `inferProfile` 支持 pnpm 的 `.pnpm/<pkg>@<ver>/node_modules` 布局，一键更新不再错误地打到 `web` profile
+* **settings:** 主文件是数组（`[]`）时视为损坏并回退 `.bak`（旧实现把数组当有效配置，整份落默认值）；stale 锁删掉后仍会检查等待截止时间，避免对手反复重建过期锁时无限循环
+* **rpc:** 回退 `rpc.handle` 的降级告警在完全缺 `webServer` 时也会打印，排障时能看到公网语义为何降级
+* **mobile:** 弹层「替换」时保留 opener，关闭后焦点仍回到最初的触发按钮（上一版 pop 掉 opener 会让焦点落回 body）
+* **docs:** README 中英文补充「手工删配置前先删 `.bak`，恢复出厂请用设置页按钮」
+
 ## [3.0.5](https://github.com/daha1216/dsh-pocket/compare/v3.0.4...v3.0.5) (2026-10-27)
 
 > 第二轮/第三轮对抗审查（认证隐私、settings 生命周期、客户端/移动端三路只读审计）后的补丁，完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。

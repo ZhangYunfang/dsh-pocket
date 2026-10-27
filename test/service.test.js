@@ -1367,14 +1367,16 @@ test('RPC 回退路径：宿主缺 webServer.register 时按本机来源降级�
   assert.equal(s.value.origin, 'loopback', '回退路径没有请求上下文，只能按本机来源');
   assert.ok(warnLines.some((l) => l.includes('webServer.register')), '必须告警说明降级原因');
 
-  // 对照：完全没有 webServer（headless/测试 fixture）也是本机来源，但不该刷告警
+  // 对照：完全没有 webServer（headless/测试 fixture）也是本机来源；告警照打——
+  // 旧实现只在 webServer.port != null 时告警，完全缺 webServer 时静默降级，与文档
+  // 「回退会 warn」不一致，排障时看不到为什么公网访客拿到了本机能力（审计 L4）。
   const headless = fakeCtxConnection();
   const quiet = [];
   installPocketRpc({ connection: headless, service }, { service, getToken: () => 'PUBPIN99', getLanToken: () => 'LANPIN99', log: { error() {}, warn: (m) => quiet.push(String(m)) } });
   const local = await headless.handler(POCKET_ENDPOINTS.status, {});
   assert.equal(local.value.origin, 'loopback');
   assert.equal(local.value.accessToken, 'PUBPIN99', '本机仍能读到公网 PIN');
-  assert.equal(quiet.some((l) => l.includes('webServer.register')), false, '没有 webServer 时不该告警');
+  assert.equal(quiet.some((l) => l.includes('webServer.register')), true, '没有 webServer 时也要告警');
 
   await service.dispose();
 });

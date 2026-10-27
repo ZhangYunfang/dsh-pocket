@@ -64,6 +64,17 @@
 - **供应链**：Homebrew bottle 拿不到 Homebrew digest 时不再回退 GitHub digest（两份构建哈希不同，回退会把正品误报「投毒」）；bottle 版本按数字段比较（`2025.10.0 > 2025.9.1`）。
 - **其它**：`hostPid` 字符串形式也能被孤儿清扫识别；PIN 文件被删后会重新生成（不再被缓存永久挡住）；`inferProfile` 正则锚定到插件安装路径；移动端焦点陷阱过滤隐藏弹层、取最上层、迁移时 pop 旧 opener；LAN PIN 读取失败与「公网不显示」分开提示；bridge 500 文案不再带内部错误。
 
+### 第四轮追加（同日，settings 生命周期对抗验证）
+
+第四轮只读子代理针对「恢复出厂 / PIN 缓存 / 安装布局」做了双进程与真实文件系统复现，确认并修复：
+
+- **恢复出厂不再「报成功实为撤销」**（high）：先把 `settings.json` 改名成墓碑，再删白名单派生文件；任一 `.bak`/`.tmp`（可能含 `tunnelToken`）删不掉就把墓碑改回主文件并返回失败。旧实现吞掉删除错误仍报 `settingsCleared:true`，而新加的 `.bak` 回退会在下次启动把旧配置整份复活。
+- **恢复出厂拿不到锁时直接失败**（high）：另一进程正在写设置时，`resetSettings()` 返回 `false`，不再等 750ms 后无锁执行——否则对方随后整份写回，结果同样是「提示成功、实际撤销」。
+- **PIN 写盘失败可自愈**：障碍（目录占用磁盘满/ACL）解除后，下一次读取会在 1s 节流内补写文件；不再出现「设置页显示 PIN-A、重启变 PIN-B、用户按页面值登录被拒」。
+- **同 tick 改写**：Windows mtime 粒度内另一实例改写 PIN 时按内容比较，不再因 mtime 相同而继续用旧值。
+- **pnpm 布局**：`inferProfile` 支持 `.pnpm/<pkg>@<ver>/node_modules`，一键更新不再错误地打到 `web` profile。
+- **边界**：主文件为 `[]` 时视为损坏并回退 `.bak`；stale 锁删掉后仍检查等待截止时间；完全缺 `webServer` 时也打印回退告警；移动端弹层替换不再丢弃 opener（关闭后焦点回到触发按钮）；README 中英补充「手工删配置前先删 `.bak`」。
+
 ## 明确不修（附理由）
 
 - **`isLoopback` 被硬编码为 true**：真正机制是代理注入的 transport shim 把 `ownsHost` 置 true；该字段只是旧宿主兜底、项目文档自认是 UI 开关，PIN 持有者等同本机操作者是设计承诺（README 安全章节已写明）。
@@ -80,9 +91,9 @@
 
 ## 验证
 
-- `node --test --test-timeout=30000 "test/*.test.js"`：**294 tests / 292 pass / 0 fail / 2 skipped**（2 个 skip 为跨平台占位用例）。
+- `node --test --test-timeout=30000 "test/*.test.js"`：**300 tests / 298 pass / 0 fail / 2 skipped**（2 个 skip 为跨平台占位用例）。
 - `npm run test:local`（真机 + 真实 Cloudflare 隧道）未执行：需要专用的 `DSH_POCKET_TEST_HOSTNAME/TOKEN/PORT` 并显式打开公网，跟本轮审计的本地回归无关；改动涉及的 LAN/公网来源分级由 `test/proxy.test.js` 与 `test/webserver-mount.test.js` 的端到端用例覆盖。
-- 关键回归用例：`?token=` 三处脱敏（含同名参数只摘 PIN、保留 dsh 启动 token、大写 `?TOKEN=`、`;` 后缀）、HTML 地址栏清理脚本、WS 认证 fail-closed、全局锁期间正确密码可登录、来源分级头不可伪造（含真实 HTTP 路由端到端）、status 的 accessToken/lanToken 按来源返回、公网来源 forbidden 矩阵（含 update/restart）、fileRead 边界 fail-closed 与 4MB 上限、删除路由信任栅栏、settings 跨进程合并/恢复出厂清派生文件与保留用户备份、孤儿 cloudflared 不误杀活实例（含字符串 hostPid）、端口顺延拒绝开公网、compareVersions 预发布段 semver 顺序、隧道流量（cf 头与 X-Forwarded-For）强制公网、classifyHost 边界表、Homebrew digest 不回退 GitHub。
+- 关键回归用例：`?token=` 三处脱敏（含同名参数只摘 PIN、保留 dsh 启动 token、大写 `?TOKEN=`、`;` 后缀）、HTML 地址栏清理脚本、WS 认证 fail-closed、全局锁期间正确密码可登录、来源分级头不可伪造（含真实 HTTP 路由端到端）、status 的 accessToken/lanToken 按来源返回、公网来源 forbidden 矩阵（含 update/restart）、fileRead 边界 fail-closed 与 4MB 上限、删除路由信任栅栏、settings 跨进程合并/恢复出厂清派生文件与保留用户备份、恢复出厂删不掉派生文件时回滚并报失败、活锁下恢复出厂直接失败、主文件为数组时回退 `.bak`、PIN 写盘失败自愈与同 tick 内容比较、`profileFromPath` 的 npm/pnpm/desktop 布局、孤儿 cloudflared 不误杀活实例（含字符串 hostPid）、端口顺延拒绝开公网、compareVersions 预发布段 semver 顺序、隧道流量（cf 头与 X-Forwarded-For）强制公网、classifyHost 边界表、Homebrew digest 不回退 GitHub。
 
 ## 复现脚本
 

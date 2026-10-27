@@ -654,9 +654,9 @@ export function mobileApply(ctx: ClientContext): void {
         // 旧实现走 close 分支后 active=null 且 return，新弹层要等下一次 DOM
         // 突变才会重新拿到焦点；上游用 innerHTML 重建卡片时可能很久没有下一次
         // 突变，期间 Tab 可以穿回背景列表，"模态"短暂失效（审计 F1）。
-        // 旧弹层的 opener 与替换后的弹层无关，丢弃它，否则新弹层关闭时焦点
-        // 会被甩回上一个弹层的触发按钮（审计 F5）。
-        triggerStack.pop()
+        // 保留 triggerStack：替换后的弹层关闭时仍要回到最初的触发按钮（close 分支有
+        // isConnected 守卫，opener 被卸载时不会乱聚焦）。审计反向验证：在这里 pop 会
+        // 让关闭弹层后焦点落回 body，对键盘/读屏用户是倒退。
         active = dialog
         if (!dialog.hasAttribute('tabindex')) dialog.setAttribute('tabindex', '-1')
         const list = focusables(dialog)

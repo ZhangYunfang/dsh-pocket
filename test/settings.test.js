@@ -447,3 +447,73 @@ test('PIN 原子写：不残留 .tmp 临时文件，写入后立即可读', () =
   assert.deepEqual(leftovers, [], '原子写不应留下临时文件');
   assert.equal(getAccessToken(), 'AtomicPIN9', '写入后立即生效');
 }));
+
+test('恢复出厂：派生文件删不掉时必须报失败并回滚主文件（否则旧配置经 .bak 复活）', () => withHome(async (home) => {
+  // 回归背景：旧实现先删主文件、再逐个吞掉派生文件的删除错误，`.bak` 删不掉也返回
+  // true；新加的 .bak 回退会在下次启动时把旧配置（含 tunnelToken）整份复活，
+  // 恢复出厂形同虚设（审计 H1 实测）。
+  const { resetSettings, setLanEnabled, settingsPath } = await import('../lib/settings.mjs');
+  setLanEnabled(false);
+  const dest = settingsPath();
+  mkdirSync(`${dest}.tmp`, { recursive: true });
+  writeFileSync(join(`${dest}.tmp`, 'blocker'), 'x'); // 非空目录：rmSync(force) 删不掉
+  writeFileSync(`${dest}.bak`, '{"tunnelToken":"OLD-SECRET"}');
+  assert.equal(resetSettings(), false, '删不干净必须如实报失败');
+  assert.equal(existsSync(dest), true, '主文件必须回滚，不能连同配置一起消失');
+  assert.equal(JSON.parse(readFileSync(dest, 'utf8')).lanEnabled, false, '回滚后原配置内容仍在');
+}));
+
+test('恢复出厂：另一个进程持锁时不得无锁执行（否则会被并发写回收复结果）', () => withHome(async (home) => {
+  const { resetSettings, setLanEnabled, settingsPath } = await import('../lib/settings.mjs');
+  setLanEnabled(false);
+  const dest = settingsPath();
+  writeFileSync(`${dest}.lock`, ''); // 活锁：mtime 是现在，不会被当过期锁删掉
+  const started = Date.now();
+  assert.equal(resetSettings(), false, '拿不到锁必须报失败');
+  assert.ok(Date.now() - started >= 500, '应当等满锁预算再放弃，而不是立刻无锁执行');
+  assert.equal(existsSync(dest), true, '未清空任何东西');
+  assert.equal(existsSync(`${dest}.lock`), true, '不能删掉别人的锁');
+}));
+
+test('设置读取：主文件是数组时视为损坏并回退 .bak（不能整份落默认值）', () => withHome(async (home) => {
+  const { lanEnabled, settingsPath } = await import('../lib/settings.mjs');
+  const dest = settingsPath();
+  mkdirSync(join(home, 'dsh-pocket'), { recursive: true });
+  writeFileSync(dest, '[]');
+  writeFileSync(`${dest}.bak`, '{"lanEnabled":false}');
+  assert.equal(lanEnabled(), false, '数组不是有效配置，必须回退读取 .bak');
+}));
+
+test('PIN 写盘失败后自愈：障碍解除后下一次读取会补写文件，不再重启就变密码', () => withHome(async (home) => {
+  const { pinWriteWarning, setCustomPin, getAccessToken } = await import('../lib/index.js');
+  const pinDir = join(home, 'dsh-pocket');
+  mkdirSync(pinDir, { recursive: true });
+  const p = join(pinDir, 'token');
+  mkdirSync(p, { recursive: true }); // token 变成目录：写文件必失败
+  assert.equal(setCustomPin('public', 'HealPIN99'), 'HealPIN99', '内存值立即可用');
+  assert.ok(pinWriteWarning('public'), '写盘失败要报告');
+  rmSync(p, { recursive: true, force: true }); // 障碍解除
+  await new Promise((resolve) => setTimeout(resolve, 1_100)); // 越过重试节流
+  assert.equal(getAccessToken(), 'HealPIN99', '仍是同一个 PIN');
+  assert.equal(pinWriteWarning('public'), null, '补写成功后不再告警');
+  assert.equal(readFileSync(p, 'utf8').trim(), 'HealPIN99', '磁盘上确实补写了 PIN');
+}));
+
+test('PIN 缓存：mtime 相同（同 tick）但内容被另一实例改写时仍跟随磁盘', () => withHome(async (home) => {
+  const { tokenForHost } = await import('../lib/index.js');
+  assert.match(tokenForHost('192.168.1.5:3081'), /^\d{8}$/);
+  const file = join(home, 'dsh-pocket', 'token-lan');
+  const m = statSync(file).mtime;
+  writeFileSync(file, 'TickPIN77');
+  utimesSync(file, m, m); // 强制 mtime 与缓存记录相同
+  assert.equal(tokenForHost('192.168.1.5:3081'), 'TickPIN77', '内容不同就应跟随磁盘');
+}));
+
+test('profile 推断：pnpm 的 .pnpm 布局仍能找到真实 profile', async () => {
+  const { profileFromPath } = await import('../lib/index.js');
+  assert.equal(profileFromPath('C:\\Users\\x\\.dsh\\profiles\\work\\node_modules\\dsh-pocket\\lib\\index.js'), 'work');
+  assert.equal(profileFromPath('C:/x/profiles/desk/node_modules/.pnpm/dsh-pocket@3.0.5/node_modules/dsh-pocket/lib/index.js'), 'desk', 'pnpm junction 布局');
+  assert.equal(profileFromPath('C:/x/profiles/desktop/node_modules/dsh-pocket/'), 'desktop');
+  assert.equal(profileFromPath('C:/app/node_modules/dsh-pocket/lib/index.js'), 'web', '非 profiles 布局退回 web');
+  assert.equal(profileFromPath('C:/x/profiles/../node_modules/dsh-pocket/'), 'web', '非法 profile 名退回 web');
+});
