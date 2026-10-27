@@ -38,6 +38,31 @@ function fmt(t, key, vars) {
   return s;
 }
 
+/** 给 fetch 加超时：隧道半开/弱网时浏览器可能永远不 resolve，界面会卡死在「进行中」。
+ * 优先用 AbortSignal.timeout（Safari 16+/Chrome 103+），不可用时退回手动 controller。 */
+async function fetchWithTimeout(url, opts, ms) {
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    return fetch(url, { ...opts, signal: AbortSignal.timeout(ms) });
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 可被 AbortSignal 提前唤醒的 sleep：组件卸载/取消后不必再多等一个轮询间隔。 */
+function sleepUnlessAborted(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) { resolve(); return; }
+    const done = () => { clearTimeout(timer); signal?.removeEventListener?.('abort', done); resolve(); };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener?.('abort', done, { once: true });
+  });
+}
+
 // 官方 DeepSeek Harness 设计系统（dsh-client-ui-theme design-platform.css）：
 // 按钮 md=36px 胶囊形 / sm=28px；品牌色 --dsw-alias-brand-primary；
 // hover 走 --dsw-alias-button-*-hover；间距 4px 栅格；正文 13px。
@@ -281,17 +306,28 @@ function PocketSettingsTab({ rpcCall, t }) {
 
   // 单项操作的进行中标记：防止连点造成请求乱序（例如开关连点，先发的「开」后到，
   // 会把「关」的结果盖掉）。mutatedAtRef 同时记录本地修改时刻，供 status 轮询判断快照新旧。
+  // pending 的值保持布尔（渲染层大量 `pending.x === true` 判断），计数单独放在 ref 里：
+  // 三个手机端偏好开关共用 'prefs' 这个 key，若直接置 true/delete，先返回的请求会把还在
+  // 飞的另一个请求的锁提前解开（连点可重复提交）。
+  const pendingCountsRef = useRef({});
   const withPending = async (key, fn) => {
     mutatedAtRef.current = Date.now();
-    setPending((p) => ({ ...p, [key]: true }));
+    const counts = pendingCountsRef.current;
+    counts[key] = (counts[key] ?? 0) + 1;
+    setPending((p) => (p[key] === true ? p : { ...p, [key]: true }));
     try {
       return await fn();
     } finally {
-      setPending((p) => {
-        const next = { ...p };
-        delete next[key];
-        return next;
-      });
+      counts[key] = Math.max(0, (counts[key] ?? 1) - 1);
+      if (counts[key] === 0) {
+        delete counts[key];
+        setPending((p) => {
+          if (p[key] !== true) return p;
+          const next = { ...p };
+          delete next[key];
+          return next;
+        });
+      }
     }
   };
 
@@ -322,7 +358,15 @@ function PocketSettingsTab({ rpcCall, t }) {
   const elapsed = (startedAt) => (startedAt ? Math.max(0, Math.floor((now - startedAt) / 1000)) : 0);
 
   const call = async (endpoint, payload) => {
-    const res = await rpcCall(endpoint, payload);
+    // 30s 上限：隧道半开时 rpc.call 可能永远不回来，导致按钮永久 disabled、只在重启时
+    // 靠整页刷新才能恢复。超时按失败处理，让用户看到错误并重试。
+    const res = await rpcCall(
+      endpoint,
+      payload,
+      typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+        ? AbortSignal.timeout(30000)
+        : undefined,
+    );
     if (!res?.ok) throw new Error(res?.error?.message ?? 'RPC failed');
     return res.value;
   };
@@ -330,16 +374,23 @@ function PocketSettingsTab({ rpcCall, t }) {
   // 重启后自动刷新：旧进程退出到新进程开始监听之间有数秒空窗（helper 还要等端口
   // 释放、dsh web 还要启动），固定 2 秒 reload 会撞上 ERR_CONNECTION_REFUSED 白屏。
   // 改成轮询本页地址直到真的能连上再刷新；30 秒还没起来就交给用户点「刷新页面」。
+  const reloadAbortRef = useRef(null);
+  useEffect(() => () => { reloadAbortRef.current?.abort(); }, []);
   const waitForHostThenReload = async () => {
+    // 每次重试最多等 3 秒：旧实现单次 fetch 永不 resolve 时会卡在 await，
+    // deadline 再也不会被检查，「刷新页面」按钮永远不出现。
+    reloadAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    reloadAbortRef.current = ctrl;
     const deadline = Date.now() + 30000;
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !ctrl.signal.aborted) {
       try {
-        const res = await fetch(location.href, { method: 'GET', cache: 'no-store' });
-        if (res.ok) { location.reload(); return; }
-      } catch { /* 新进程还没起来 */ }
-      await new Promise((r) => setTimeout(r, 1000));
+        const res = await fetchWithTimeout(location.href, { method: 'GET', cache: 'no-store' }, 3000);
+        if (res.ok) { if (!ctrl.signal.aborted) location.reload(); return; }
+      } catch { /* 新进程还没起来 / 单次请求超时 */ }
+      await sleepUnlessAborted(1000, ctrl.signal);
     }
-    setAutoReloadFailed(true);
+    if (!ctrl.signal.aborted) setAutoReloadFailed(true);
   };
 
   const load = async () => {
@@ -667,7 +718,7 @@ function PocketSettingsTab({ rpcCall, t }) {
   const saveCustomPin = (which) => withPending('savePin', async () => {
     // 先做本地长度校验，不合法就不发请求（服务端还会再校验一次）
     if (String(customPin?.value ?? '').length < 8) {
-      setCustomPin((c) => ({ ...(c ?? {}), err: '密码至少 8 位 | PIN must be at least 8 characters' }));
+      setCustomPin((c) => ({ ...(c ?? {}), err: t('pinInvalid') }));
       return;
     }
     try {
@@ -692,6 +743,9 @@ function PocketSettingsTab({ rpcCall, t }) {
 
   const lanUrl = status?.lanUrl;
   const tunnelUrl = status?.tunnelUrl;
+  // 公网来源（隧道）只能管理自己的密码：隧道开关/配置、局域网开关、恢复出厂
+  // 都是本机主人的动作，服务端会回 forbidden，前端据此直接隐藏而不是让用户点了报错。
+  const publicView = status?.origin === 'public';
   const tunnelPhase = tunnelState?.phase ?? 'idle';
   const tunnelStarting = ['downloading', 'starting', 'registering'].includes(tunnelPhase);
   const tunnelStateDetail = tunnelState?.detail ?? '';
@@ -725,7 +779,10 @@ function PocketSettingsTab({ rpcCall, t }) {
     lastFocusRef.current = document.activeElement;
     const onKey = (e) => {
       if (e.key !== 'Escape') return;
+      // 弹窗自己消费掉 Esc：只 preventDefault 的话事件继续冒泡到宿主监听器，
+      // 一次 Esc 会同时关掉弹窗与设置分区（用户填到一半的表单随之丢失）。
       e.preventDefault();
+      e.stopPropagation();
       if (disclaimerOpen) { setDisclaimerOpen(false); return; }
       if (lanToggleOpen !== null) { setLanToggleOpen(null); return; }
       if (resetOpen) setResetOpen(false);
@@ -823,8 +880,19 @@ function PocketSettingsTab({ rpcCall, t }) {
         className: 'dshp-input is-mono',
         style: { width: 150, textAlign: 'center' },
         type: 'password', minLength: 8, maxLength: 64,
+        name: 'dsh-pocket-pin', autoComplete: 'new-password', spellCheck: false,
         value: customPin?.value ?? '', autoFocus: true,
-        onChange: (e) => setCustomPin((c) => ({ ...c, value: e.target.value.replace(/[^a-zA-Z0-9]/g, ''), err: null })),
+        // 过滤掉字母数字以外的字符（服务端也只收 [a-zA-Z0-9]），但不能再静默吞：
+        // 粘贴全角/中文时用户得知道字符被忽略了，否则只会看到「长度不够」。
+        onChange: (e) => {
+          const raw = e.target.value;
+          const filtered = raw.replace(/[^a-zA-Z0-9]/g, '');
+          setCustomPin((c) => ({
+            ...c,
+            value: filtered,
+            err: filtered.length === raw.length ? null : t('pinCharsFiltered'),
+          }));
+        },
         onKeyDown: (e) => { if (e.key === 'Enter') saveCustomPin(which); if (e.key === 'Escape') setCustomPin(null); },
       }),
       Btn({ variant: 'primary', mini: true, onClick: () => saveCustomPin(which), disabled: pending.savePin === true }, t('save')),
@@ -893,6 +961,7 @@ function PocketSettingsTab({ rpcCall, t }) {
         h('input', {
           className: 'dshp-input is-mono',
           type: 'password',
+          name: 'dsh-pocket-tunnel-token', autoComplete: 'off', spellCheck: false,
           value: tunnelCfg.token ?? '',
           onChange: (e) => setTunnelCfg((c) => ({ ...c, token: e.target.value.trim(), err: null })),
           onKeyDown: (e) => { if (e.key === 'Enter') saveNamedTunnel(); if (e.key === 'Escape') setTunnelCfg(null); },
@@ -969,7 +1038,9 @@ function PocketSettingsTab({ rpcCall, t }) {
     }) : null,
 
     // 更新提示——琥珀色提示条（有新版本/更新中/已更新待重启，单状态不并存；桌面端不渲染）
-    !isDesktop && updateInfo ? Alert({ kind: 'warn', icon: Ico.download,
+    // 公网访客不渲染：服务端已拒绝公网走 update/restart（forbidden），露出按钮只会
+    // 让用户点了报错；更新/重启属于本机能力。
+    !isDesktop && !publicView && updateInfo ? Alert({ kind: 'warn', icon: Ico.download,
       title: updateInfo.updated
         ? fmt(t, 'updatedRestart', { ver: updateInfo.current })
         : updateInfo.result === 'ok'
@@ -1002,8 +1073,10 @@ function PocketSettingsTab({ rpcCall, t }) {
     // 卡片：标题 + 副题 + 总开关 → 二维码 → 访问密码 → 高级（手动选地址）
     Card({
       key: 'lan', icon: Ico.lan, title: t('lanAccess'), sub: t('lanHint'),
-      right: Switch(status?.lanEnabled !== false, () => requestLanToggle(status?.lanEnabled === false), !status || pending.lanToggle === true, t('lanAccess')),
-      children: !status
+      right: Switch(status?.lanEnabled !== false, () => requestLanToggle(status?.lanEnabled === false), !status || pending.lanToggle === true || publicView, t('lanAccess')),
+      children: publicView
+        ? h('div', { className: 'dshp-hint' }, t('lanLocalOnly'))
+        : !status
         ? h('div', { className: 'dshp-loading' }, t('loadingStatus'))
         : status.lanEnabled === false
           ? Alert({
@@ -1023,12 +1096,17 @@ function PocketSettingsTab({ rpcCall, t }) {
                 ? null
                 : (customPin?.which === 'lan'
                   ? customPinRow('lan')
-                  : h('div', null,
-                    pinValueRow('lan', status.lanToken, [
-                      Btn({ variant: 'ghost', mini: true, icon: Ico.refresh, onClick: refreshLanPin, disabled: pending.refreshPin === true }, t('refresh')),
-                      customBtn('lan'),
-                    ]),
-                    status.lanPinCustom ? h('div', { className: 'dshp-warn-text' }, t('pinCustomHint')) : null)),
+                  : status.lanToken
+                    ? h('div', null,
+                      pinValueRow('lan', status.lanToken, [
+                        Btn({ variant: 'ghost', mini: true, icon: Ico.refresh, onClick: refreshLanPin, disabled: pending.refreshPin === true }, t('refresh')),
+                        customBtn('lan'),
+                      ]),
+                      status.lanPinCustom ? h('div', { className: 'dshp-warn-text' }, t('pinCustomHint')) : null)
+                    // 公网访问时后端故意不返回局域网 PIN（防止隧道访客拿到后
+                    // 在同一 WiFi 下直连、绕过「关掉隧道」这种撤销手段）。
+                    // 本机/局域网拿不到则是读取失败，不要误报成「远端不显示」。
+                    : h('div', { className: 'dshp-hint' }, publicView ? t('lanPinRemoteHint') : t('lanPinUnavailable'))),
               Row({
                 label: t('advAddress'),
                 control: Btn({ variant: 'ghost', mini: true, onClick: () => setAdvOpen((v) => !v) }, (status.lanIpOverride || t('lanAddressAuto')) + (advOpen ? ' ‹' : ' ›')),
@@ -1050,8 +1128,12 @@ function PocketSettingsTab({ rpcCall, t }) {
     // 卡片：标题 + 副题 + 总开关（开=已连隧道）；开启经免责声明弹窗确认
     Card({
       key: 'wan', icon: Ico.wan, title: t('wanAccess'), sub: t('namedWanHint'),
-      right: Switch(!!tunnelUrl, () => (tunnelUrl ? stopTunnel() : startTunnel()), tunnelStarting || pending.wan === true || pending.saveNamed === true || !status, t('wanAccess')),
-      children: !status
+      right: Switch(!!tunnelUrl, () => (tunnelUrl ? stopTunnel() : startTunnel()), tunnelStarting || pending.wan === true || pending.saveNamed === true || !status || publicView, t('wanAccess')),
+      children: publicView
+        ? h('div', null,
+          tunnelUrl ? QRBlock({ src: status?.tunnelQr, url: tunnelUrl, hint: t('namedRunningHint') }) : null,
+          h('div', { className: 'dshp-hint' }, t('wanLocalOnly')))
+        : !status
         ? h('div', { className: 'dshp-loading' }, t('loadingStatus'))
         : h('div', null, wanStatusView, wanBody),
     }),
@@ -1087,7 +1169,9 @@ function PocketSettingsTab({ rpcCall, t }) {
     // ── 维护：恢复出厂设置（最底部，避免误触）────────────────────────────────
     Card({
       key: 'reset', icon: Ico.trash, title: t('resetFactory'), sub: t('resetIntro'), danger: true,
-      right: Btn({ variant: 'danger', mini: true, onClick: () => setResetOpen(true), disabled: pending.reset === true }, t('resetGo')),
+      right: publicView
+        ? h('div', { className: 'dshp-hint' }, t('resetLocalOnly'))
+        : Btn({ variant: 'danger', mini: true, onClick: () => setResetOpen(true), disabled: pending.reset === true }, t('resetGo')),
     }),
 
     // 页脚署名行：开发者 · Star · 反馈

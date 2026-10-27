@@ -61,8 +61,9 @@ export function compareVersions(a, b) {
     const aNum = /^\d+$/.test(ax);
     const bNum = /^\d+$/.test(bx);
     if (aNum && bNum) return Number(ax) - Number(bx); // 数值比较
-    if (aNum) return 1; // 数字段 > 文本段
-    if (bNum) return -1;
+    // semver：数字标识符优先级低于字母数字标识符（1.0.0-1 < 1.0.0-alpha）
+    if (aNum) return -1;
+    if (bNum) return 1;
     return ax < bx ? -1 : 1; // 字典序
   }
   return 0;

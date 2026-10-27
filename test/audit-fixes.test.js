@@ -71,6 +71,33 @@ test('fileRead：能枚举工作区时只允许读工作区内的文件', async 
   }
 });
 
+test('fileRead：工作区枚举失败/形状异常/没有工作区时 fail-closed（不再退化成任意可读）', async () => {
+  const target = tmpFile('secret.txt', 'secret-content\n');
+  try {
+    // 旧实现把所有异常吞成空数组，然后 `roots.length > 0 && ...` 直接跳过边界，
+    // 于是 list() 抛错、返回非数组、或插件 fiber 未激活时任意文件都可读。
+    const broken = [
+      { list: () => { throw new Error('boom'); } },
+      { list: 'not-an-array' },
+      { list: { weird: true } },
+    ];
+    for (const svc of broken) {
+      const { ctx, call } = makeCtx({ workspaceRegistry: svc });
+      installPocketRpc(ctx, { service: { status: async () => ({}) } });
+      const res = await call(POCKET_ENDPOINTS.fileRead, { path: target.file });
+      assert.equal(res.ok, false, '枚举失败时不得读取工作区外文件');
+      assert.match(String(res.error?.message ?? ''), /工作区边界|boundary/, '应说明边界不可用');
+    }
+    // 服务在但一个工作区都没开：同样不能当成「没有限制」。
+    const empty = makeCtx({ workspaceRegistry: { list: [] } });
+    installPocketRpc(empty.ctx, { service: { status: async () => ({}) } });
+    const res2 = await empty.call(POCKET_ENDPOINTS.fileRead, { path: target.file });
+    assert.equal(res2.ok, false, '没有工作区时应拒绝读取');
+  } finally {
+    try { unlinkSync(target.file); } catch { /* ignore */ }
+  }
+});
+
 test('isTrustedLoopbackRequest：IPv6 方括号与 127.0.0.0/8 都算 loopback', () => {
   const req = (headers) => ({ headers });
   assert.equal(isTrustedLoopbackRequest(req({ host: '[::1]:3080' })), true, '[::1]:3080 应受信');
@@ -234,19 +261,27 @@ test('上游中途断开：错误文案不得拼进已发出的响应正文', as
     upstream: { host: '127.0.0.1', port: up.address().port },
   });
   try {
-    const body = await new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(''), 3_000);
+    const { body, failed } = await new Promise((resolve) => {
+      // 失败/超时也必须可区分：旧写法超时直接 resolve('')，断言永远成立——
+      // 代理根本没转发内容时这个用例也是绿的（审计指出）。
+      const timer = setTimeout(() => resolve({ body: '', failed: 'timeout' }), 3_000);
+      let received = '';
       const req = httpRequest({ host: '127.0.0.1', port: proxy.port, method: 'GET', path: '/' }, (res) => {
-        let data = '';
-        const done = () => { clearTimeout(timer); resolve(data); };
-        res.on('data', (c) => { data += c; });
-        res.on('end', done);
-        res.on('error', done);
-        res.on('aborted', done);
+        res.on('data', (c) => { received += c; });
+        res.on('end', () => { clearTimeout(timer); resolve({ body: received }); });
+        res.on('aborted', () => { clearTimeout(timer); resolve({ body: received }); });
+        res.on('error', (err) => { clearTimeout(timer); resolve({ body: received, failed: err.message }); });
       });
-      req.on('error', () => { clearTimeout(timer); resolve(''); });
+      req.on('error', (err) => { clearTimeout(timer); resolve({ body: received, failed: err.message }); });
       req.end();
     });
+    assert.notEqual(failed, 'timeout', '必须真的收到上游响应（否则断言等于没测）');
+    // 代理对上游中断的处理是「终止连接」：要么已经转发过部分正文，要么
+    // socket 被销毁（socket hang up / aborted）。两者都算正确；挂着不响应才是 bug。
+    if (!body.includes('partial-content')) {
+      assert.match(String(failed), /socket hang up|aborted|ECONNRESET/i,
+        `上游中断后应终止连接，实际: ${body.slice(-120)} / ${failed}`);
+    }
     assert.ok(!body.includes('无法连接上游'), `响应正文混入了上游错误说明: ${body.slice(-120)}`);
     assert.ok(!body.includes('upstream unreachable'), '英文错误文案同样不应出现');
   } finally {
@@ -396,4 +431,55 @@ test('删除事务：目录整体搬迁失败 → payload 名字复原，且不�
   assert.equal(dirs.existsSync(path.join(sessionPath, 'session.jsonl.trash')), false,
     '不得留下 .trash 残骸');
   dirs.rmSync(root, { recursive: true, force: true });
+});
+
+test('删除路由：优先走宿主 connection.requestRejection（方法调用），未认证不得删除', async () => {
+  // 回归背景：路由只做 Host/Origin 静态检查、完全不看浏览器认证。dsh web 按官方
+  // 方式绑局域网时，任何 LAN 主机伪造 Host: 127.0.0.1:3080 即可无 PIN 删会话。
+  const { mountSessionDeleteRoute } = await import('../lib/delete-session.mjs');
+  const { Readable } = await import('node:stream');
+  const routes = [];
+  const webServer = { register: (route) => { routes.push(route); return () => {}; } };
+  const mkReq = (body) => {
+    const stream = Readable.from([Buffer.from(JSON.stringify(body))]);
+    stream.method = 'POST';
+    stream.headers = { host: '127.0.0.1:3080', 'content-type': 'application/json' };
+    return stream;
+  };
+  const mkRes = () => ({
+    status: 0, body: '',
+    writeHead(status) { this.status = status; },
+    end(payload) { this.body = String(payload ?? ''); },
+  });
+
+  // ① 宿主判 401：必须以方法形式调用（this 绑定）并原样返回 401
+  let touched = 0;
+  mountSessionDeleteRoute({
+    webServer,
+    connection: {
+      marker: 42,
+      requestRejection() { return this.marker === 42 ? 401 : 403; },
+    },
+    get: () => { touched += 1; return {}; },
+  }, { warn() {} });
+  const res1 = mkRes();
+  await routes.at(-1).handler(mkReq({ sessionId: 's1' }), res1);
+  assert.equal(res1.status, 401, '未认证的 LAN 请求应 401');
+  assert.equal(touched, 0, '被拒请求不得触碰 persistence');
+
+  // ② 没有 requestRejection（旧宿主）时回退静态栅栏：非 loopback Host → 403
+  routes.length = 0;
+  mountSessionDeleteRoute({ webServer, get: () => ({}) }, { warn() {} });
+  const res2 = mkRes();
+  const req2 = mkReq({ sessionId: 's1' });
+  req2.headers = { host: '192.168.1.50:3080', 'content-type': 'application/json' };
+  await routes.at(-1).handler(req2, res2);
+  assert.equal(res2.status, 403, '非 loopback Host 应 403');
+
+  // ③ 放行后 persistence 缺失 → 503（不是 400 空体/挂起）
+  routes.length = 0;
+  mountSessionDeleteRoute({ webServer, connection: { requestRejection: () => undefined }, get: () => undefined }, { warn() {} });
+  const res3 = mkRes();
+  await routes.at(-1).handler(mkReq({ sessionId: 's1' }), res3);
+  assert.equal(res3.status, 503, 'persistence 缺失应 503');
 });

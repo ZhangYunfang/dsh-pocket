@@ -232,6 +232,7 @@ export function startFileGuard(
   // 产生新元素（无标记），MutationObserver 重新补上按钮。
   // H4b/c：与 onClick 拦截同款的两层豁免——消息流之外的、明确角色的目标不注入
   // （否则会在文件查看器 tab、会话行、菜单项旁边长出无关按钮）。
+  let copySeq = 0;
   const injectCopyButtons = (root: ParentNode = document): void => {
     const links = root.querySelectorAll('button, a')
     const own = root instanceof Element && root.matches('button, a') ? [root, ...links] : links
@@ -242,9 +243,24 @@ export function startFileGuard(
       const txt = (el.textContent ?? '').trim()
       if (!looksLikeFilePath(txt)) return
       el.setAttribute('data-mobile-nav-copy', '1')
+      // 按钮与它所属的链接用同一个 id 绑定：React 重建行时旧链接被换掉，我们
+      // 插入的按钮却还留在同一个父节点里（它不在 React 的虚拟 DOM 中，不会
+      // 被回收）。没有反查关系就只能看到「同一条文件后面长出两个复制按钮」，
+      // 长会话里持续堆积（审计 F3）。注入新按钮前先清掉父节点里已失配的旧按钮。
+      const copyId = String(++copySeq)
+      el.setAttribute('data-mobile-nav-copy-id', copyId)
+      const parentEl = el.parentElement
+      if (parentEl !== null) {
+        for (const stale of Array.from(parentEl.querySelectorAll(':scope > [data-mobile-nav="copy-file"]'))) {
+          if (stale.previousElementSibling?.getAttribute('data-mobile-nav-copy-id') !== stale.getAttribute('data-mobile-nav-copy-for')) {
+            stale.remove()
+          }
+        }
+      }
       const btn = document.createElement('button')
       btn.type = 'button'
       btn.setAttribute('data-mobile-nav', 'copy-file')
+      btn.setAttribute('data-mobile-nav-copy-for', copyId)
       btn.textContent = t('fileCopy')
       btn.addEventListener('click', async (e) => {
         e.preventDefault()

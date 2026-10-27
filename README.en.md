@@ -110,7 +110,7 @@ The public address is your configured hostname and **does not change on restart*
 
 **Upgrade compatibility:** old Quick Tunnel enable/restore markers do not restore random tunnels; public access stays off without configuration. Complete existing Named Tunnel hostname/Token configurations remain usable. Only a previously enabled named tunnel with a restore marker and complete configuration auto-restores after a DSH restart. A factory reset stops public access and clears the hostname, Token and restore marker; public access stays off until configured again.
 
-> Upgrading: re-run the `add` command above (the GitHub address carries no tag, so it installs the latest commit on the default branch). To pin a version, write `github:daha1216/dsh-pocket#v3.0.3` instead, and re-`add` with the new tag when you want to move.
+> Upgrading: re-run the `add` command above (the GitHub address carries no tag, so it installs the latest commit on the default branch). To pin a version, write `github:daha1216/dsh-pocket#v3.0.8` instead, and re-`add` with the new tag when you want to move.
 
 ### CLI public access
 
@@ -129,6 +129,7 @@ The Cloudflare hostname route's **Service must target the CLI's actual listening
 - **Public detection is fail-closed** (issue #66): everything except loopback and private LAN addresses is treated as **public and PIN-gated** — including any self-hosted tunnel / reverse proxy pointing at the local port with its own hostname. There is no "change the domain to bypass the PIN" hole.
 - LAN mode exposes nothing publicly; only devices on the same network can reach it.
 - Built for personal use; the plugin's public PIN lives in `$DSH_HOME/dsh-pocket/token` (not rotated on stop/start or restart), the LAN PIN in `$DSH_HOME/dsh-pocket/token-lan` (refreshed manually in Settings), and switches, custom flags and public configuration in `$DSH_HOME/dsh-pocket/settings.json`.
+- **Delete `.bak` before deleting the config by hand**: when a write fails, `settings.json.bak` is kept as a fallback and is read when the main file is missing/corrupt (otherwise one failed write would lose everything, including the Tunnel Token). Deleting only `settings.json` lets the old backup "come back" on the next start; use **Reset to factory defaults** in Settings instead — it clears the main file and all derived files atomically and reports failure honestly if anything cannot be removed.
 - **CLI mode (`dsh-pocket`) also requires a PIN by default**: a random 8-digit PIN is printed in the terminal and embedded in the QR code; manual address entry requires the PIN, while loopback access is exempt. Use `--pin <value>` or `DSH_POCKET_PIN=<value>` to set it yourself (at least 6 characters). `--no-auth` disables protection and is **not recommended**: anyone who can reach the port could operate a code-executing DSH.
 
 ## 💻 DSH Desktop

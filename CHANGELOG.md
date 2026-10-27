@@ -1,3 +1,107 @@
+## [3.0.8](https://github.com/daha1216/dsh-pocket/compare/v3.0.7...v3.0.8) (2026-10-27)
+
+> 第六轮对抗验证（CLI/更新链路、并发与内存生命周期）后的补丁，完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。
+
+### Security
+
+* **update:** Windows 上 `spawn('dsh', …)`/`taskkill` 固定 `cwd: homedir()`——两者都会先搜当前目录，宿主工作区里放同名的 `dsh.cmd`/`tasklist.exe` 就能在“检查更新”“启停隧道”时以宿主权限执行（横穿 DSH 沙箱边界）；`tasklist`/`taskkill` 同样处理
+* **restart:** 自重启日志改为 `mkdtemp` 私有目录（0700）+ 文件 0600：旧实现把可预测名字的 0644 日志放共享 tmpdir，同机用户可预建符号链接读走 dsh web 的启动 token
+* **restart:** 辅助进程异步 `error` 或拿不到 pid 时不再安排 500ms 自杀——旧实现会把旧宿主杀掉而不拉起新进程，服务直接停摆
+* **cli:** `--no-auth` 不再静默压过 `--pin`/`DSH_POCKET_PIN`（现在直接拒绝启动），并在非 `--public` 时提示用户自建隧道/端口转发同样会暴露无密码入口
+* **cli:** `--host`/`--port`/`--launch-token` 缺值不再吞掉下一个 flag；`--port` 校验 1-65535；`--host` 私网 IP 直接用于局域网二维码（此前打印未监听的网卡地址）
+* **cli:** 新增 `--launch-token`，新版 dsh 首屏 `/api` 401 时可显式传入（CLI 拿不到 `dsh web` 打印的启动 token，插件模式会自动注入）
+* **ip:** `isValidIpv4` 拒绝 `0.0.0.0`/广播/组播/前导零地址，避免把不可展示的地址写进二维码
+
+### Bug Fixes
+
+* **proxy:** WS 并发增加每 IP 上限（32）与全站 `maxConnections=256`、`headersTimeout`/`requestTimeout`——无上限时单个出口 IP 开几百条长连接即可耗尽 fd/内存
+* **proxy:** session/list 瘦身上限 64MB→16MB，并限制同时瘦身的并发数（3）——无全局预算时 32 条 64MB 响应约 2GB RSS，OOM 的是 dsh web 宿主
+* **proxy:** 手工清缓存导出 `clearProxyCaches()`；代理关闭时清空 immutable/session-list 缓存（此前 34MB 缓存常驻到进程退出）；handshake 重试计数按 4096 上限淘汰
+* **proxy:** WS 升级成功后释放 `proxyReq._header`（内含 cookie）并摘掉“升级前断开”监听，不再按连接数累积
+* **ci:** 测试前重建 `client/client.js` 并 `git diff --exit-code`，源码改了产物没重建会直接红
+* **pkg:** `files` 补 `NOTICE.md`
+
+## [3.0.7](https://github.com/daha1216/dsh-pocket/compare/v3.0.6...v3.0.7) (2026-10-27)
+
+> 第五轮对抗验证（proxy 安全回归，48b5ea9 → 9af15ca）后的补丁，完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。
+
+### Security
+
+* **proxy:** 已配置密码但当前 Host 不受保护（本机入口 / 关掉局域网密码）时，分享链接里的 `?token=<PIN>` 现在也会在转发前剥离——旧实现只在受保护 Host 上构造剥离列表，明文密码会进上游访问日志与地址栏；HTTP 与 WS 两条通道都补了 `__pocketTokenScrubbed` 标记
+* **proxy:** issue #91 的 303 握手过渡页也注入地址栏清理脚本，PIN 不再留在浏览器历史；同时删除上游 303 的 `content-encoding`，避免明文过渡页被按 gzip 解码成白屏
+* **proxy:** HTML 注入跳过 204/304（无正文响应），不再写出与实际不符的 `content-length`、不再清掉 304 的 `etag`/`last-modified` 缓存验证器
+* **proxy:** `?token` / `?token=` 空值不再计为一次密码尝试——扫描器或截断的分享链接不能把共享出口 IP 锁 60 秒
+
+### Bug Fixes
+
+* **proxy:** `::ffff:127.0.0.1` 这类 IPv4-mapped IPv6 字面量按嵌入的 IPv4 分类，protected 模式下本机访问不再被要求公网 PIN
+* **proxy:** WS 上游握手补 `x-dsh-pocket-origin`，与 HTTP 侧来源分级保持一致
+* **test:** 新增未保护 Host 的 PIN 剥离、303 过渡页清理脚本、304 不改写、空 token 不计数、IPv4-mapped 分类 5 条回归
+
+## [3.0.6](https://github.com/daha1216/dsh-pocket/compare/v3.0.5...v3.0.6) (2026-10-27)
+
+> 第四轮对抗验证（settings 生命周期 / PIN 缓存 / pnpm 安装布局）后的补丁，完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。
+
+### Security
+
+* **settings:** 恢复出厂改为「持锁 + 墓碑回滚」：先把 `settings.json` 改名成墓碑、删完全部派生文件后才丢弃；任一派生文件（`.bak`/`.tmp`，可能含 `tunnelToken`）删不掉就回滚主文件并返回失败。旧实现吞掉删除错误仍报成功，主文件缺失时新加的 `.bak` 回退会让旧配置整份复活，恢复出厂形同虚设
+* **settings:** 恢复出厂拿不到锁（另一进程正在写）时直接返回失败，不再等 750ms 后无锁执行——否则另一进程随后整份写回，同样变成「提示成功、实际撤销」
+
+### Bug Fixes
+
+* **index:** PIN 写盘失败后障碍解除会自动补写（每秒最多试一次），不再出现「设置页显示 PIN-A、重启后变 PIN-B、用户按页面上的值登录被拒」；Windows 同 tick 改写按内容判定，不再因 mtime 相同而认旧值
+* **index:** `inferProfile` 支持 pnpm 的 `.pnpm/<pkg>@<ver>/node_modules` 布局，一键更新不再错误地打到 `web` profile
+* **settings:** 主文件是数组（`[]`）时视为损坏并回退 `.bak`（旧实现把数组当有效配置，整份落默认值）；stale 锁删掉后仍会检查等待截止时间，避免对手反复重建过期锁时无限循环
+* **rpc:** 回退 `rpc.handle` 的降级告警在完全缺 `webServer` 时也会打印，排障时能看到公网语义为何降级
+* **mobile:** 弹层「替换」时保留 opener，关闭后焦点仍回到最初的触发按钮（上一版 pop 掉 opener 会让焦点落回 body）
+* **docs:** README 中英文补充「手工删配置前先删 `.bak`，恢复出厂请用设置页按钮」
+
+## [3.0.5](https://github.com/daha1216/dsh-pocket/compare/v3.0.4...v3.0.5) (2026-10-27)
+
+> 第二轮/第三轮对抗审查（认证隐私、settings 生命周期、客户端/移动端三路只读审计）后的补丁，完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。
+
+### Security
+
+* **proxy:** `?TOKEN=` 大写、`?token=<PIN>;foo=1` 这类变体现在同样能认证、同样在转发前剥离；地址栏清理脚本按键名小写匹配，同名参数只摘 PIN、不误删 dsh 启动 token
+* **proxy:** 源为 loopback 且带 `cf-ray`/`cf-connecting-ip`/`X-Forwarded-For`/`X-Real-IP`/`Forwarded` 的请求强制按公网判定——命名隧道或本地反代把 Host 改写成 `127.0.0.1` 不再能把公网入口降级成免密本机
+* **proxy:** `classifyHost`/`isLoopbackHost` 共用同一套归一化（`127.evil.com`、`127.0.0.1.`、IPv6 字面量不再误判）；全局锁期间错误猜测要消耗比较预算，分布式穷举失去无限比对
+* **rpc:** 公网来源禁止 `update`/`restart`（会拉 npm 包并重启宿主），设置页更新横幅在公网来源下不渲染；回退 `rpc.handle` 通道对无请求上下文的宿主显式告警降级原因
+* **settings:** 恢复出厂改为持锁 + 白名单删除（不再误删 `settings.json.mybackup` 或别人持有的 `.lock`）；stale 锁删不掉时不再无限忙等；主文件损坏/丢失时回退读 `.bak`
+* **tunnel:** Homebrew bottle 拿不到 Homebrew digest 时不再回退 GitHub digest（两份构建哈希不同，会把正品误报「投毒」）；bottle 版本按数字段比较
+
+### Bug Fixes
+
+* **settings:** 锁等待从 2s 降到 750ms，减少设置写入阻塞主线程
+* **service:** 字符串形式的 `hostPid` 也能被孤儿清扫识别，不再误杀共用 `$DSH_HOME` 的活实例
+* **index:** PIN 文件被删后会重新生成（不再被缓存永久挡住）；`inferProfile` 锚定到插件安装路径，避免 `DSH_HOME` 路径含 `profiles` 时更新错目标
+* **mobile:** 焦点陷阱过滤隐藏/inert 弹层并取最上层，弹层替换时 pop 旧 opener；文件复制按钮与链接按 id 清理失配项
+* **client:** 公网来源不显示更新/重启按钮；LAN PIN 读取失败与「公网不显示」分开提示；bridge 500 文案不再带内部错误细节
+
+## [3.0.4](https://github.com/daha1216/dsh-pocket/compare/v3.0.3...v3.0.4) (2026-10-27)
+
+> 完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。
+
+### Security
+
+* **proxy:** `?token=` 认证通过后从上游请求行 / 子资源 `Referer` / 访问日志中剥离明文 PIN，并在首屏 HTML 注入 `history.replaceState` 清掉地址栏里的密码
+* **proxy:** 限速器区分单 IP 锁与全局锁——全局锁期间正确密码仍可登录，未认证请求不能再靠打满失败次数把主人永久锁在门外；WS 认证与 HTTP 对齐 fail-closed
+* **proxy:** 认证后按不可伪造来源（loopback/lan/public）写入 `x-dsh-pocket-origin`；`status` 只向 loopback 回传公网 PIN、不向公网回传局域网 PIN
+* **rpc:** 公网来源禁止刷新/开关局域网、禁止改隧道配置与启停隧道、禁止恢复出厂（服务端 `forbidden`，设置页同步隐藏）
+* **rpc:** fileRead 工作区边界改为 fail-closed（枚举失败/为空/形状异常一律拒绝），扩充凭据黑名单，非字符串路径 400，错误文案不再回显绝对路径
+* **delete:** 删除路由改用宿主 `connection.requestRejection`（含浏览器认证），无该方法才回退 Host/Origin 检查
+* **bin:** CLI 与插件统一 8 位 PIN 下限；拒绝 `--public` + `--no-auth`；`--pin` 缺值不再吞掉下一个 flag；纯空白 PIN 报错
+* **tunnel:** macOS 清华 bottle 源改为用 Homebrew API 的 sha256 校验，拿不到 digest 时显式告警（此前该源完全跳过校验）
+
+### Bug Fixes
+
+* **proxy:** 给 `session/list` 请求体与响应、HTML 注入分支加缓冲上限/解压上限，避免单请求让宿主涨 150MB 级内存或被解压炸弹打爆
+* **settings:** 恢复出厂清掉 `.bak/.tmp/.lock`，不再残留含 `tunnelToken` 的临时文件
+* **service:** `tunnel-auto.json` 记录宿主 pid，孤儿清扫不再误杀共用 `$DSH_HOME` 的另一个实例正在用的 cloudflared；端口顺延后拒绝开公网；主动停止隧道时同步摘掉 spawnedPids
+* **index:** PIN 原子写 + 按 mtime 失效缓存；更新超时用 `taskkill /T` 杀整棵进程树；fork 守卫校验 registry 响应状态，探测失败不再放行覆盖本地 fork
+* **restart:** 交接辅助进程使用宿主实际端口，不再因 argv 缺 `--port` 回退 3080 白等 20s
+* **client:** `withPending` 引用计数、fetch 超时、`waitForHostThenReload` 可中断、Esc 不冒泡；PIN 输入框补 autocomplete 并对被过滤字符提示
+* **mobile:** 弹层被替换时焦点陷阱直接迁移而不是当成关闭；文件复制按钮与链接绑定 id，React 重建后清理失配按钮
+
 ## [3.0.3](https://github.com/daha1216/dsh-pocket/compare/v3.0.2...v3.0.3) (2026-10-27)
 
 > 3.0.0–3.0.2 是 named-only 安全加固线（关闭 semantic-release 的 npm 发布后未再生成条目），本版起恢复手写记录。

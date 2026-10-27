@@ -4,10 +4,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, request as httpRequest } from 'node:http';
 import { connect } from 'node:net';
+import { createHash } from 'node:crypto';
 import { gzipSync, brotliDecompressSync } from 'node:zlib';
 import { WebSocket, WebSocketServer } from 'ws';
 
-import { createPocketProxy, createHandshakeTracker, DEFAULT_INJECT, SW_SCRIPT, SW_SCRIPT_PATH, SW_REGISTER_SCRIPT, HASHED_ASSET_RE } from '../lib/proxy.mjs';
+import { createPocketProxy, createHandshakeTracker, classifyHost, DEFAULT_INJECT, SW_SCRIPT, SW_SCRIPT_PATH, SW_REGISTER_SCRIPT, HASHED_ASSET_RE } from '../lib/proxy.mjs';
 
 /** 构造一个带掩码的 WS 文本帧（浏览器在握手后立即发的首帧，会进 upgrade 的 head）。 */
 function maskedTextFrame(text) {
@@ -692,6 +693,72 @@ test('访问令牌认证（issue #13）：公网需登录、cookie 放行、局�
   await new Promise((r) => up.close(r));
 });
 
+test('WS 认证 fail-closed（issue #66 的 WS 版）：取不到 PIN 时受保护 Host 必须 5xx，不能 101', async () => {
+  const up = createServer((_req, res) => res.end('upstream'));
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  // getToken 返回 null 模拟「PIN 文件读失败」：HTTP 侧 503 fail-closed，
+  // WS 侧旧实现 `token && !wsAuth.ok` 会整段跳过鉴权直接 101 放行。
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    auth: { getToken: () => null, isProtected: () => true },
+  });
+  try {
+    const line = await new Promise((resolve) => {
+      const sock = connect(proxy.port, '127.0.0.1', () => {
+        sock.write('GET /api/events.mux HTTP/1.1\r\nHost: abc.trycloudflare.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n');
+      });
+      let buf = '';
+      const timer = setTimeout(() => { sock.destroy(); resolve('timeout'); }, 2000);
+      sock.on('data', (c) => {
+        buf += c.toString('latin1');
+        if (buf.includes('\r\n')) { clearTimeout(timer); sock.destroy(); resolve(buf.split('\r\n')[0]); }
+      });
+      sock.on('error', () => { clearTimeout(timer); resolve('error'); });
+    });
+    assert.doesNotMatch(line, /101/, 'WS 不得在缺少 PIN 时放行');
+    assert.match(line, /50[0-9]/, `WS 应 fail-closed（实得 ${line}）`);
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+test('来源分级头由代理重写（客户端伪造无效）；带 ?token= 的 HTML 注入地址栏清理脚本', async () => {
+  const TOKEN = '12345678';
+  const seen = [];
+  const up = createServer((req, res) => {
+    seen.push({ url: req.url, origin: req.headers['x-dsh-pocket-origin'] });
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end('<html><head></head><body>dsh</body></html>');
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    auth: { getToken: () => TOKEN, isProtected: () => true },
+  });
+  try {
+    // 公网 Host + 客户端自称 loopback：代理必须按源地址判成 public。
+    const r = await new Promise((resolve, reject) => {
+      const req = httpRequest({ host: '127.0.0.1', port: proxy.port, path: `/?token=${TOKEN}`, headers: { Host: 'abc.trycloudflare.com', Accept: 'text/html', 'x-dsh-pocket-origin': 'loopback' } }, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    assert.equal(r.status, 200);
+    assert.equal(seen[0].origin, 'public', '入站伪造的 x-dsh-pocket-origin 被丢弃，按源地址重写');
+    assert.doesNotMatch(seen[0].url, new RegExp(TOKEN), '明文 PIN 不进入上游请求行');
+    assert.match(r.body, /data-dsh-pocket-token-scrub="1"/, 'HTML 注入地址栏清理脚本');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
 test('会话保持（issue #33）：登录 cookie 绑定进程 sessionKey，持久 30 天；重启后旧 cookie 失效需重新输入', async () => {
   const http = await import('node:http');
   const { createHash } = await import('node:crypto');
@@ -927,6 +994,10 @@ test('登录速率限制（issue #40 改进版 A）：单 IP 失败达阈值锁�
     const r4 = await login2('10.1.0.100', '00000000'); // 新 IP → 被全局锁拦下
     assert.equal(r4.status, 429, '新 IP 也被全局锁拦截（防换 IP 绕过）');
     assert.ok(r4.body.includes('尝试次数过多'), '全局锁提示');
+    // 全局锁不能变成永久 DoS：攻击者 50 次坏 PIN 后，持有正确密码的机主/新设备
+    // 仍然必须能登录（旧实现连正确密码也一起 429，只有 trustedIps 例外）。
+    const r5 = await login2('10.1.0.101', TOKEN);
+    assert.equal(r5.status, 302, '全局锁期间正确密码仍可登录');
   } finally {
     await proxy2.close();
     await new Promise((r) => up.close(r));
@@ -1503,6 +1574,82 @@ function rawGet(port, path, headers = {}) {
   });
 }
 
+// —— 隐私：分享链接里的明文 PIN 不留在下游任何地方 ——
+
+test('隐私：?token=<PIN> 命中后明文 PIN 不再进上游请求行 / Referer / 访问日志', async () => {
+  // 背景：扫码/分享链接形如 `http://ip:3081/?token=<明文 PIN>`。旧实现种完 cookie 就
+  // 原样转发——PIN 会出现在代理访问日志（`GET /?token=… -> 200`）、上游请求行，以及
+  // 首屏之后每个子资源的 Referer 里（`Referer: http://ip:3081/?token=…`）。日志常被
+  // 贴进 issue，等于把访问密码公开。
+  const PIN = 'pin12345';
+  const SK = 'sess-key';
+  const seen = [];
+  const logs = [];
+  const up = createServer((req, res) => {
+    seen.push({ url: req.url, referer: req.headers.referer });
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body>hi</body></html>');
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    auth: { getToken: () => PIN, isProtected: () => true, sessionKey: SK },
+    log: (line) => logs.push(line),
+  });
+  const hashed = createHash('sha256').update(`${PIN}:${SK}`).digest('hex');
+  const get = (path, headers = {}) => new Promise((resolve, reject) => {
+    const req = httpRequest({ host: '127.0.0.1', port: proxy.port, path, headers: { Host: 'x:3081', Accept: 'text/html', ...headers } }, (res) => {
+      res.resume(); res.on('end', () => resolve({ status: res.statusCode, headers: res.headers }));
+    });
+    req.on('error', reject); req.end();
+  });
+  try {
+    // 1) 首次扫码直达（顺带种 cookie），其他 query 参数要保留
+    const r1 = await get(`/?token=${PIN}&keep=1`);
+    assert.equal(r1.status, 200, '分享链接直达 200');
+    const sc = Array.isArray(r1.headers['set-cookie']) ? r1.headers['set-cookie'].join(';') : String(r1.headers['set-cookie'] ?? '');
+    assert.ok(sc.includes(`dsh_pocket_token=${hashed}`), '仍然照常种认证 cookie');
+
+    // 2) 已种 cookie 后再次打开「收藏的分享链接」——用户每次打开都还带着 PIN
+    const r2 = await get(`/?token=${PIN}`, { Cookie: `dsh_pocket_token=${hashed}` });
+    assert.equal(r2.status, 200, '收藏的分享链接仍可直达');
+
+    // 3) 子资源：浏览器会自动带首屏地址当 Referer
+    const r3 = await get('/assets/a.js', {
+      Referer: `http://192.168.1.5:3081/?token=${PIN}&x=1`,
+      Cookie: `dsh_pocket_token=${hashed}`,
+      Accept: 'text/javascript',
+    });
+    assert.equal(r3.status, 200, '子资源 200');
+
+    // 4) 同名参数并存：`token=<PIN>` 与 dsh 自己的启动 token 同名，只摘 PIN，
+    //    不能把启动 token 一起删掉（否则上游握手被打破），也不能漏摘排在后面的 PIN
+    const r4 = await get(`/?token=${PIN}&token=DSHLAUNCH&keep=1`, { Cookie: `dsh_pocket_token=${hashed}` });
+    assert.equal(r4.status, 200, '同名参数请求 200');
+
+    for (const hit of seen) {
+      assert.ok(!String(hit.url).includes(PIN), `上游请求行不得出现明文 PIN（实得：${hit.url}）`);
+    }
+    assert.ok(seen.some((h) => h.url === '/?keep=1'), '非 token 的 query 参数必须保留');
+    const launchKept = seen.find((h) => String(h.url).includes('token=DSHLAUNCH'));
+    assert.ok(launchKept, '与 PIN 同名的 dsh 启动 token 必须保留');
+    assert.ok(!String(launchKept.url).includes(PIN), '保留启动 token 时 PIN 仍要摘掉');
+    assert.match(String(launchKept.url), /keep=1/, '其余参数一并保留');
+    const asset = seen.find((h) => String(h.url).startsWith('/assets/a.js'));
+    assert.ok(asset, '子资源请求到达上游');
+    assert.ok(!String(asset.referer ?? '').includes(PIN), `Referer 不得带明文 PIN（实得：${asset.referer}）`);
+
+    assert.ok(logs.length > 0, '访问日志有记录');
+    for (const line of logs) {
+      assert.ok(!line.includes(PIN), `访问日志不得出现明文 PIN（实得：${line}）`);
+    }
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
 test('慢加载：SW 脚本由代理直出，注册脚本随 DEFAULT_INJECT 注入', async () => {
   const up = await fakeUpstream();
   const proxy = await createPocketProxy({ port: 0, host: '127.0.0.1', upstream: { host: '127.0.0.1', port: up.port } });
@@ -1788,4 +1935,246 @@ test('Range 请求：206 分片响应不得被代理压缩（否则浏览器解�
     await proxy.close();
     await new Promise((r) => up.close(r));
   }
+});
+
+// —— 第三轮对抗审查回归：大小写 / `;` 后缀 / Host 分类 / 隧道流量降级 ——
+
+test('隐私：大写 ?TOKEN= 与带 ; 后缀的 PIN 也必须在认证后被摘掉', async () => {
+  const PIN = 'pin12345';
+  const seen = [];
+  const up = createServer((req, res) => {
+    seen.push(req.url);
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('ok');
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    auth: { getToken: () => PIN, isProtected: () => true, sessionKey: 'sk' },
+  });
+  try {
+    // 大小写：`?TOKEN=` 与 `?token=` 等价（认证命中、且必须摘掉）
+    const upper = await rawGet(proxy.port, `/?TOKEN=${PIN}&keep=1`, { Accept: 'text/html' });
+    assert.equal(upper.status, 200, '大写参数同样能认证');
+    // 分号后缀：`token=<PIN>;x=1` 作为一个值也要认、也要摘
+    const semi = await rawGet(proxy.port, `/?token=${PIN};x=1`, { Accept: 'text/html' });
+    assert.equal(semi.status, 200, '带分号后缀同样能认证');
+
+    assert.deepEqual(seen, ['/?keep=1', '/'], `上游只能看到清理后的目标，实际: ${JSON.stringify(seen)}`);
+    for (const url of seen) assert.ok(!String(url).includes(PIN), '任何形式都不得把明文 PIN 转给上游');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+test('classifyHost：可注册域名/尾点/IPv6 字面量不再被判成本机（与 isLoopbackHost 对齐）', () => {
+  // 旧实现 `/^127\./` 直接匹配字符串：`127.evil.com` 是可注册域名，会被判 loopback
+  assert.equal(classifyHost('127.evil.com'), 'public', '127.evil.com 是可注册域名，必须 public');
+  assert.equal(classifyHost('127.0.0.1.'), 'loopback', '带尾点的 loopback 仍是 loopback');
+  assert.equal(classifyHost('localhost.'), 'loopback', '带尾点的 localhost 仍是 loopback');
+  assert.equal(classifyHost('[2001:db8::1]'), 'public', '公网 IPv6 字面量不是本机');
+  assert.equal(classifyHost('[fd00::1]:3081'), 'lan', 'ULA IPv6 是局域网');
+  assert.equal(classifyHost('::1'), 'loopback', 'IPv6 loopback');
+  assert.equal(classifyHost('100.64.0.9'), 'lan', 'CGNAT 仍是局域网');
+  assert.equal(classifyHost('0.0.0.0'), 'loopback', '通配地址按本机处理');
+  assert.equal(classifyHost('nas.local'), 'lan', 'mDNS 名仍是局域网');
+  assert.equal(classifyHost('example.com'), 'public');
+});
+
+test('隧道流量：loopback 源 + Cloudflare 边缘头时，Host 伪装成本机也必须走公网密码', async () => {
+  const PIN = 'PUBPIN12';
+  const seen = [];
+  const up = createServer((req, res) => {
+    seen.push(req.url);
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body>upstream</body></html>');
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    // 公网与局域网用不同 PIN：如果隧道流量被降级成 loopback/lan，会拿到 LAN PIN 而放行
+    auth: { getToken: (host) => (classifyHost(host) === 'public' ? PIN : 'LANPIN12'), isProtected: () => true, sessionKey: 'sk' },
+  });
+  const cfGet = (path) => new Promise((resolve, reject) => {
+    const req = httpRequest({
+      host: '127.0.0.1', port: proxy.port, path,
+      // cloudflared 的典型形态：TCP 源 loopback、Host 被 ingress 写成 127.0.0.1、
+      // 带 Cloudflare 边缘注入头（客户端伪造不了 cf-ray）。
+      headers: { host: `127.0.0.1:${proxy.port}`, accept: 'text/html', 'cf-ray': '8a1b2c3d4e5f6a7b-SJC', 'cf-connecting-ip': '203.0.113.9' },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+  const proxyGet = (path, headers) => new Promise((resolve, reject) => {
+    const req = httpRequest({ host: '127.0.0.1', port: proxy.port, path, headers }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+  try {
+    const noToken = await cfGet('/');
+    assert.equal(noToken.status, 200, '未认证返回登录页 200');
+    assert.match(noToken.body, /登录|password|访问密码/i, '必须要求公网密码');
+    assert.equal(seen.length, 0, '未认证的隧道请求不能到达上游');
+
+    const wrongPin = await cfGet(`/?token=LANPIN12`);
+    assert.equal(seen.length, 0, '局域网 PIN 不能登公网入口');
+
+    const okPin = await cfGet(`/?token=${PIN}`);
+    assert.equal(okPin.status, 200);
+    assert.deepEqual(seen, ['/'], '公网 PIN 通过，且 PIN 已从请求行摘掉');
+
+    // 本地反代（nginx 的 proxy_set_header Host $proxy_host）把 Host 改成 loopback、
+    // 只注入 X-Forwarded-For：同样必须按公网处理。
+    seen.length = 0;
+    const viaProxy = await proxyGet('/', {
+      host: `127.0.0.1:${proxy.port}`, accept: 'text/html', 'x-forwarded-for': '198.51.100.7',
+    });
+    assert.equal(viaProxy.status, 200);
+    assert.match(viaProxy.body, /登录|password|访问密码/i, '反代流量也要密码');
+    assert.equal(seen.length, 0, '反代的未认证请求同样不能到上游');
+    const viaProxyOk = await proxyGet(`/?token=${PIN}`, {
+      host: `127.0.0.1:${proxy.port}`, accept: 'text/html', 'x-forwarded-for': '198.51.100.7',
+    });
+    assert.equal(viaProxyOk.status, 200);
+    assert.deepEqual(seen, ['/'], '反代流量用公网 PIN 可登录');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+// —— 第四轮对抗审查回归（a4a70e47）：未保护 Host 的 PIN 剥离 / 303 过渡页 / 304 / 空 token / IPv4-mapped ——
+
+test('隐私：auth 已配置但 Host 不受保护时，分享链接里的 PIN 也不得转给上游', async () => {
+  // F1：旧实现只在 protectedHost 分支构造 acceptedTokens，不受保护的 Host（本机入口、
+  // 或关掉局域网密码）上 token 为 null → stripPocketToken 拿到空列表直接 return，
+  // 于是 `GET /?token=<PIN>` 把明文密码原样写进上游访问日志。不认证不等于可以转发密码。
+  const PIN = 'pin12345';
+  const seen = [];
+  const up = createServer((req, res) => {
+    seen.push(req.url);
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('ok');
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    // 本机入口：isProtected=false，不要求密码；但 PIN 仍不该被当普通参数转发
+    auth: { getToken: () => PIN, isProtected: () => false, sessionKey: 'sk' },
+  });
+  try {
+    const res = await rawGet(proxy.port, `/?token=${PIN}&keep=1`, { Accept: 'text/html' });
+    assert.equal(res.status, 200);
+    assert.deepEqual(seen, ['/?keep=1'], `不受保护的 Host 也要摘掉 PIN，实际: ${JSON.stringify(seen)}`);
+    assert.ok(!String(seen[0]).includes(PIN), '上游不得看到明文 PIN');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+test('隐私：launch token 的 303 过渡页也要带地址栏清理脚本，且不保留上游 content-encoding', async () => {
+  // F2 + F8：issue #91 的过渡页直接发 handshakePageHtml()，没有 scrub 脚本 → PIN 留在历史；
+  // 同时旧实现保留上游 303 的 content-encoding（gzip），浏览器按 gzip 解明文过渡页 → 白屏。
+  const PIN = 'pin12345';
+  const up = createServer((req, res) => {
+    const body = gzipSync(Buffer.from('redirecting', 'utf8'));
+    res.writeHead(303, {
+      location: '/',
+      'content-type': 'text/html; charset=utf-8',
+      'content-encoding': 'gzip',
+      'content-length': String(body.length),
+    });
+    res.end(body);
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    auth: { getToken: () => PIN, isProtected: () => true, sessionKey: 'sk' },
+    launchToken: () => 'LAUNCHTOK', // 触发 launch token 注入 → 上游 303 → 过渡页分支
+  });
+  try {
+    const res = await rawGet(proxy.port, `/?token=${PIN}`, { Accept: 'text/html' });
+    assert.equal(res.status, 200, '303 被改写为 200 过渡页（Safari 不保存 3xx 的 cookie）');
+    assert.equal(res.headers['content-encoding'], undefined, '明文过渡页不能带 content-encoding');
+    assert.equal(res.headers.location, undefined, '不把 303 留给浏览器重做');
+    const html = res.body.toString('utf8');
+    assert.match(html, /data-dsh-pocket-token-scrub/, '过渡页也要注入历史清理脚本');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+test('注入分支不碰 304/204：缓存验证器与 content-length 不得被改写', async () => {
+  // F3：304 没有正文，旧实现仍跑 HTML 注入 → 写出与实际不符的 content-length、
+  // 并清掉 etag/last-modified（缓存验证器）。
+  const up = createServer((req, res) => {
+    res.writeHead(304, { etag: '"abc123"', 'content-type': 'text/html; charset=utf-8' });
+    res.end();
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+  });
+  try {
+    const res = await rawGet(proxy.port, '/', { Accept: 'text/html', 'if-none-match': '"abc123"' });
+    assert.equal(res.status, 304);
+    assert.equal(res.headers.etag, '"abc123"', '304 的 etag 必须保留');
+    assert.equal(res.headers['content-length'], undefined, '304 不能凭空写出 content-length');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+test('限速：空的 ?token= / ?token 不算密码尝试，不能把出口 IP 锁死', async () => {
+  // F4：旧实现 hasQueryToken 只看键存在 → `?token=` 空值也计数，共享 NAT 里 5 个
+  // 截断链接/扫描器就能让整个出口 IP 锁 60s。这里把单 IP 阈值降到 1，验证空值不计数。
+  const PIN = 'pin12345';
+  const up = createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('ok');
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    auth: { getToken: () => PIN, isProtected: () => true, sessionKey: 'sk' },
+    rateLimit: { maxFailures: 1, globalMaxFailures: 100, lockMs: 60_000, globalLockMs: 60_000 },
+  });
+  try {
+    for (const path of ['/?token=', '/?token']) {
+      const empty = await rawGet(proxy.port, path, { Accept: 'text/html' });
+      assert.notEqual(empty.status, 429, `空 token 不应触发锁定（${path}）`);
+    }
+    const ok = await rawGet(proxy.port, `/?token=${PIN}`, { Accept: 'text/html' });
+    assert.equal(ok.status, 200, '空 token 没有消耗失败预算，正确 PIN 仍应直达');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+test('classifyHost：IPv4-mapped IPv6 字面量按嵌入的 IPv4 分类', () => {
+  // F6：`::ffff:127.0.0.1` 是双栈环境下浏览器可能给出的本机字面量，旧实现当陌生域名 →
+  // protected 模式下本机访问反而要公网 PIN。
+  assert.equal(classifyHost('::ffff:127.0.0.1'), 'loopback');
+  assert.equal(classifyHost('[::ffff:127.0.0.1]:3081'), 'loopback');
+  assert.equal(classifyHost('::ffff:192.168.1.9'), 'lan');
+  assert.equal(classifyHost('::ffff:203.0.113.9'), 'public');
 });

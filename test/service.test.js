@@ -7,9 +7,9 @@ import { createPocketService, selectLanIPv4 } from '../lib/service.mjs';
 import { installPocketRpc } from '../lib/web-rpc.js';
 import { POCKET_RPC_CHANNEL, POCKET_ENDPOINTS } from '../client/api.js';
 import { isValidIpv4 } from '../lib/ip.mjs';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 function fakeCtxConnection() {
   let handler = null;
@@ -621,8 +621,13 @@ test('自重启：restartHost 用 detached 辅助进程交接，旧进程随后�
     },
   });
   assert.equal(result.helperPid, 4242, '返回辅助进程 pid');
-  assert.ok(result.logOut.endsWith('.out.log'), '输出日志路径');
-  assert.ok(result.logErr.endsWith('.err.log'), '错误日志路径');
+  // 日志放在每次重启新建的私有目录里（防共享 tmpdir 的预测名/符号链接抢注）
+  assert.equal(basename(result.logOut), 'out.log', '输出日志文件名');
+  assert.equal(basename(result.logErr), 'err.log', '错误日志文件名');
+  assert.equal(dirname(result.logOut), dirname(result.logErr), '两个日志同目录');
+  if (process.platform !== 'win32') {
+    assert.equal(statSync(dirname(result.logOut)).mode & 0o777, 0o700, '日志目录仅本人可进');
+  }
   // 辅助进程：node -e <helperCode>，detached，代码内含新 dsh 的启动命令
   assert.equal(calls.length, 1, '只拉起一个辅助进程');
   const helper = calls[0];
@@ -663,6 +668,32 @@ test('自重启失败：spawn 抛错 → 返回 helperPid:null 和错误', async
   });
   assert.equal(result.helperPid, null);
   assert.match(result.error, /boom/);
+});
+
+test('自重启失败：辅助进程异步 spawn 失败/没有 pid 时绝不杀宿主', async () => {
+  const { restartHost } = await import('../lib/restart.js');
+  const { EventEmitter } = await import('node:events');
+  const killed = [];
+
+  // 情形 1：spawn 返回对象但 pid 为空（例如被 EDR 拦截后只给了一个空壳）
+  const noPid = restartHost({
+    internals: { spawn: () => ({ pid: undefined, unref() {}, once() {} }), kill: (pid) => killed.push(pid) },
+  });
+  assert.equal(noPid.helperPid, null);
+  assert.match(noPid.error, /did not spawn/);
+
+  // 情形 2：异步 'error' 事件（EMFILE 等只能在事件循环里报告）→ 必须取消 500ms 自杀
+  const helper = new EventEmitter();
+  helper.pid = 4243;
+  helper.unref = () => {};
+  const asyncFail = restartHost({
+    internals: { spawn: () => helper, kill: (pid) => killed.push(pid) },
+  });
+  assert.equal(asyncFail.helperPid, 4243);
+  helper.emit('error', new Error('EMFILE'));
+
+  await new Promise((r) => setTimeout(r, 700));
+  assert.deepEqual(killed, [], '两种失败都不应结束当前宿主（否则旧进程没了、新进程也没起来）');
 });
 
 test('readRestartNotice：真实文件系统（无文件/坏 JSON/过期/有效）', async () => {
@@ -893,6 +924,8 @@ test('compareVersions：语义化版本比较', async () => {
   assert.ok(compareVersions('1.0.4-rc.10', '1.0.4-rc.9') > 0, '预发布数字段按数值（rc.10 > rc.9）');
   assert.ok(compareVersions('1.0.4-rc.9', '1.0.4-rc.10') < 0, '反过来');
   assert.ok(compareVersions('1.0.4-alpha.1', '1.0.4-alpha.10') < 0, 'alpha.1 < alpha.10（数值比较）');
+  assert.ok(compareVersions('1.0.4-1', '1.0.4-alpha') < 0, '数字标识符低于字母（semver 规则）');
+  assert.ok(compareVersions('1.0.4-alpha', '1.0.4-1') > 0, '反过来');
 });
 
 test('stop 竞态：stop 打断 in-flight 后立即 start，不会并发 spawn cloudflared', async () => {
@@ -962,18 +995,49 @@ test('tsinghuaBottleUrl：按平台/架构匹配清华 bottle（Windows 无匹�
   try {
     // Windows：无 Homebrew bottle → null
     assert.equal(await tsinghuaBottleUrl({ os: 'windows', a: 'amd64' }), null, 'Windows 不走清华');
-    // macOS arm64 → 清华 arm64_ 开头的 bottle URL
-    const macUrl = await tsinghuaBottleUrl({ os: 'darwin', a: 'arm64' });
-    assert.ok(macUrl && macUrl.includes('mirrors.tuna.tsinghua.edu.cn'), 'macOS 有清华 URL: ' + macUrl);
-    assert.ok(/arm64_(sequoia|sonoma|tahoe)\.bottle\.tar\.gz$/.test(macUrl), '匹配 arm64 macOS bottle: ' + macUrl);
+    // macOS arm64 → 清华 arm64_ 开头的 bottle URL + Homebrew tag（查校验和要用）
+    const macBottle = await tsinghuaBottleUrl({ os: 'darwin', a: 'arm64' });
+    assert.ok(macBottle?.url?.includes('mirrors.tuna.tsinghua.edu.cn'), 'macOS 有清华 URL: ' + macBottle?.url);
+    assert.ok(/arm64_(sequoia|sonoma|tahoe)\.bottle\.tar\.gz$/.test(macBottle.url), '匹配 arm64 macOS bottle: ' + macBottle.url);
+    assert.match(macBottle.tag, /^arm64_(sequoia|sonoma|tahoe)$/, 'tag 必须带 arm64_ 前缀（Homebrew API 的键）');
     // macOS Intel → 无 arm64 前缀的 bottle
-    const intelUrl = await tsinghuaBottleUrl({ os: 'darwin', a: 'amd64' });
-    assert.ok(intelUrl && !/arm64_/.test(intelUrl), 'Intel 用无前缀 bottle: ' + intelUrl);
+    const intelBottle = await tsinghuaBottleUrl({ os: 'darwin', a: 'amd64' });
+    assert.ok(intelBottle?.url && !/arm64_/.test(intelBottle.url), 'Intel 用无前缀 bottle: ' + intelBottle?.url);
+    assert.match(intelBottle.tag, /^(sequoia|sonoma|tahoe|monterey|ventura)$/, 'Intel tag 不带前缀');
     // Linux：Homebrew bottle 的 ELF 解释器是占位符，不能直接用 → 跳过清华（issue #22）
     assert.equal(await tsinghuaBottleUrl({ os: 'linux', a: 'arm64' }), null, 'Linux 不走清华（Homebrew bottle 不可用）');
   } finally {
     globalThis.fetch = origFetch;
   }
+});
+
+test('tsinghuaBottleUrl：版本号按数字段比较（2025.10.0 不能输给 2025.9.1）', async () => {
+  const { tsinghuaBottleUrl } = await import('../lib/tunnel.mjs');
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    text: async () => `
+      <a href="cloudflared-2025.9.1.arm64_sonoma.bottle.tar.gz">
+      <a href="cloudflared-2025.10.0.arm64_sonoma.bottle.tar.gz">
+    `,
+  });
+  try {
+    const bottle = await tsinghuaBottleUrl({ os: 'darwin', a: 'arm64' });
+    assert.ok(bottle.url.includes('2025.10.0'), `必须按数字段选最新版本，实际: ${bottle.url}`);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('expectedDigestFor：Homebrew bottle 永不拿 GitHub 的 digest 校验（正品不能被误判投毒）', async () => {
+  const { expectedDigestFor } = await import('../lib/tunnel.mjs');
+  const official = 'a'.repeat(64);
+  const homebrew = { verifyDigest: true, digestSource: 'homebrew', expectedDigest: null };
+  assert.equal(expectedDigestFor(homebrew, official), null,
+    'bottle 源拿不到 Homebrew digest 时只能只做尺寸校验，回退 GitHub digest 会误杀正品');
+  assert.equal(expectedDigestFor({ ...homebrew, expectedDigest: 'b'.repeat(64) }, official), 'b'.repeat(64));
+  assert.equal(expectedDigestFor({ verifyDigest: true }, official), official, 'GitHub 资产/镜像用官方 digest');
 });
 
 test('桌面端（desktop=true）：update/restart 关闭，status 带标志，正常功能不受影响', async () => {
@@ -1035,6 +1099,31 @@ test('startProxy：端口被占（EADDRINUSE）时自动尝试下一个端口', 
   await service.dispose();
 });
 
+test('startTunnel：代理因端口占用顺延后拒绝开公网（ingress 指向原端口会 502 或命中别的实例）', async () => {
+  let attempts = 0;
+  const internals = {
+    ...stubInternals(),
+    createProxy: async ({ port: p }) => {
+      attempts += 1;
+      if (attempts === 1) {
+        const e = new Error('address in use');
+        e.code = 'EADDRINUSE';
+        throw e;
+      }
+      return { port: p, close: async () => {} };
+    },
+  };
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
+  try {
+    await service.startProxy();
+    await assert.rejects(() => service.startTunnel(), /3082[\s\S]*ingress|ingress[\s\S]*3082/, '必须拦住而不是静默 502');
+    const st = await service.status();
+    assert.equal(st.portShifted, true, 'status 暴露端口顺延，UI 才能提示');
+  } finally {
+    await service.dispose();
+  }
+});
+
 for (const [label, mode, cfg, shouldRestore] of [
   ['旧无 mode 标记 + 无配置', undefined, undefined, false],
   ['旧无 mode 标记 + 旧 quick 配置', undefined, namedTunnelConfig({ mode: 'quick' }), false],
@@ -1090,6 +1179,45 @@ for (const [label, mode, cfg, shouldRestore] of [
     }
   }));
 }
+
+test('孤儿清扫：marker 属于仍存活的另一个实例时绝不杀它的隧道', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dshp-orphan-'));
+  const dir = join(home, 'dsh-pocket');
+  mkdirSync(dir, { recursive: true });
+  const statePath = join(dir, 'tunnel-auto.json');
+  const killed = [];
+  const internals = {
+    ...stubInternals(),
+    isProcessAlive: (pid) => pid === 7777, // 7777 是「另一个还活着的 DSH 实例」
+    isOrphanCloudflared: async () => true,
+    killPid: async (pid) => { killed.push(pid); },
+  };
+  const service = createPocketService({
+    dshPort: 3080, port: 3081, home, internals,
+    // 不合格配置 → restore 走 killOrphanCloudflared + clearAutoTunnel 分支
+    getTunnelConfig: () => ({ mode: 'named', token: '', hostname: '' }),
+    log: { info() {}, warn() {} },
+  });
+  try {
+    writeFileSync(statePath, JSON.stringify({ at: Date.now(), mode: 'named', pid: 4242, hostPid: 7777 }));
+    await service.restoreTunnelIfNeeded();
+    assert.deepEqual(killed, [], '宿主仍存活时不能把它正在用的 cloudflared 当孤儿杀掉');
+    assert.equal(existsSync(statePath), false, '不合格的恢复标记仍要清掉');
+
+    // 宿主已死：允许清扫上次遗留的 cloudflared
+    writeFileSync(statePath, JSON.stringify({ at: Date.now(), mode: 'named', pid: 4242, hostPid: 8888 }));
+    await service.restoreTunnelIfNeeded();
+    assert.deepEqual(killed, [4242], '宿主已死的 marker 才允许清扫');
+
+    // hostPid 被写成字符串（旧版本/手工编辑）：必须仍被识别成活宿主，不能误杀
+    writeFileSync(statePath, JSON.stringify({ at: Date.now(), mode: 'named', pid: 4242, hostPid: '7777' }));
+    await service.restoreTunnelIfNeeded();
+    assert.deepEqual(killed, [4242], '字符串形式的 hostPid 也要过存活守卫');
+  } finally {
+    await service.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
 test('公网隧道自动恢复：开启时持久化标记，重启后 restoreTunnelIfNeeded 自动拉起（issue #11）', async () => {
   const fsp = await import('node:fs/promises');
@@ -1201,6 +1329,7 @@ test('RPC：局域网密码独立于公网；lanTokenRefresh 刷新并返回新�
     getToken: () => '99999999',
     getLanToken: () => lan,
     refreshLanToken: () => { lan = '22222222'; return lan; },
+    setCustomPin: (_which, value) => value,
     log: { error() {}, warn() {} },
   });
   await service.startProxy();
@@ -1214,6 +1343,71 @@ test('RPC：局域网密码独立于公网；lanTokenRefresh 刷新并返回新�
   assert.equal(r.value.lanToken, '22222222', '刷新返回新密码');
   const s2 = await conn.handler(POCKET_ENDPOINTS.status, {});
   assert.equal(s2.value.lanToken, '22222222', 'status 反映新密码');
+
+  // 来源分级：公网 PIN 只回给本机（loopback）客户端。LAN/公网客户端拿到
+  // accessToken 等于拿到一条离网也能用、且不随启停更换的持久通道（审计 F3）。
+  const sLan = await conn.handler(POCKET_ENDPOINTS.status, {}, undefined, 'lan');
+  assert.equal(sLan.value.accessToken, null, 'LAN 客户端不回显公网 PIN');
+  const sPub = await conn.handler(POCKET_ENDPOINTS.status, {}, undefined, 'public');
+  assert.equal(sPub.value.accessToken, null, '公网客户端不回显公网 PIN');
+  // 局域网 PIN 同理：公网访客拿到它就能在同一 WiFi 下直连局域网入口。
+  assert.equal(sLan.value.lanToken, '22222222', 'LAN 客户端可看到局域网 PIN');
+  assert.equal(sPub.value.lanToken, null, '公网客户端不回显局域网 PIN');
+  const sLocal = await conn.handler(POCKET_ENDPOINTS.status, {}, undefined, 'loopback');
+  assert.equal(sLocal.value.accessToken, '99999999', '本机客户端仍可看到公网 PIN');
+  assert.equal(sLocal.value.lanToken, '22222222', '本机客户端仍可看到局域网 PIN');
+
+  // 公网通道不能操作局域网通道：刷新/开关/自定义密码/绑定地址都必须拒绝。
+  for (const [endpoint, payload] of [
+    [POCKET_ENDPOINTS.lanTokenRefresh, {}],
+    [POCKET_ENDPOINTS.lanAuthSetEnabled, { on: false }],
+    [POCKET_ENDPOINTS.lanSetEnabled, { on: false }],
+    [POCKET_ENDPOINTS.lanSetOverride, { ip: '192.168.1.9' }],
+    [POCKET_ENDPOINTS.pinSetCustom, { which: 'lan', value: '33333333' }],
+    [POCKET_ENDPOINTS.pocketReset, { confirm: true }],
+    [POCKET_ENDPOINTS.tunnelStart, { disclaimer: true }],
+    [POCKET_ENDPOINTS.tunnelStop, {}],
+    [POCKET_ENDPOINTS.tunnelSetConfig, { mode: 'named', hostname: 'evil.example.com' }],
+    // 更新会拉 npm 包并重启宿主：公网访客点一下就能打断服务/换掉供应链，必须同样拒绝
+    [POCKET_ENDPOINTS.update, {}],
+    [POCKET_ENDPOINTS.restart, {}],
+  ]) {
+    const r = await conn.handler(endpoint, payload, undefined, 'public');
+    assert.equal(r.ok, false, `公网来源必须拒绝 ${endpoint}`);
+    assert.equal(r.error.code, 'forbidden', `公网来源拒绝 ${endpoint} 时用 forbidden`);
+  }
+  assert.equal(sPub.value.origin, 'public', 'status 暴露来源分级给前端');
+  assert.equal(sLocal.value.origin, 'loopback', 'status 暴露来源分级给前端（本机）');
+  // 局域网来源改自己的密码仍然允许（它本来就是局域网的主人）。
+  const lanOwn = await conn.handler(POCKET_ENDPOINTS.pinSetCustom, { which: 'lan', value: '33333333' }, undefined, 'lan');
+  assert.equal(lanOwn.ok, true, '局域网来源可以改局域网密码');
+
+  await service.dispose();
+});
+
+test('RPC 回退路径：宿主缺 webServer.register 时按本机来源降级并告警（已知限制）', async () => {
+  // 场景：0.1.5 之前的宿主没有 webServer，只能走 connection.rpc.handle；这条路没有
+  // HTTP 请求上下文，拿不到代理写的 x-dsh-pocket-origin，只能按 loopback 处理——
+  // 与 README「PIN 持有者等同本机操作者」一致，但要在日志里告警，方便确认降级原因。
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals: stubInternals(), getTunnelConfig: namedTunnelConfig });
+  const warnLines = [];
+  const withProxy = fakeCtxConnection();
+  const ctxWithProxy = { connection: withProxy, service, webServer: { port: 3080 } }; // 有 webServer 但无 register
+  installPocketRpc(ctxWithProxy, { service, getToken: () => 'PUBPIN99', getLanToken: () => 'LANPIN99', log: { error() {}, warn: (m) => warnLines.push(String(m)) } });
+  const s = await withProxy.handler(POCKET_ENDPOINTS.status, {});
+  assert.equal(s.value.origin, 'loopback', '回退路径没有请求上下文，只能按本机来源');
+  assert.ok(warnLines.some((l) => l.includes('webServer.register')), '必须告警说明降级原因');
+
+  // 对照：完全没有 webServer（headless/测试 fixture）也是本机来源；告警照打——
+  // 旧实现只在 webServer.port != null 时告警，完全缺 webServer 时静默降级，与文档
+  // 「回退会 warn」不一致，排障时看不到为什么公网访客拿到了本机能力（审计 L4）。
+  const headless = fakeCtxConnection();
+  const quiet = [];
+  installPocketRpc({ connection: headless, service }, { service, getToken: () => 'PUBPIN99', getLanToken: () => 'LANPIN99', log: { error() {}, warn: (m) => quiet.push(String(m)) } });
+  const local = await headless.handler(POCKET_ENDPOINTS.status, {});
+  assert.equal(local.value.origin, 'loopback');
+  assert.equal(local.value.accessToken, 'PUBPIN99', '本机仍能读到公网 PIN');
+  assert.equal(quiet.some((l) => l.includes('webServer.register')), true, '没有 webServer 时也要告警');
 
   await service.dispose();
 });

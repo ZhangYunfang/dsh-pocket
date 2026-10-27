@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
-import { writeFileSync, mkdtempSync, unlinkSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, unlinkSync, realpathSync } from 'node:fs';
 import { installPocketRpc } from '../lib/web-rpc.js';
 import { POCKET_ENDPOINTS } from '../client/api.js';
 
@@ -35,7 +35,9 @@ test('fileRead 读取真实文件返回正文', async () => {
   const res = await call(POCKET_ENDPOINTS.fileRead, { path: file });
   assert.equal(res.ok, true);
   assert.equal(res.value.content, 'hello dsh-pocket\n');
-  assert.equal(res.value.path, file);
+  // Windows 临时目录可能是 8.3 短名（C:\Users\ADMINI~1\...），而 RPC 返回的是
+  // realpath 长名；用 native realpath 归一后再比，断言两者指向同一文件。
+  assert.equal(realpathSync.native(res.value.path), realpathSync.native(file));
   assert.equal(res.value.size, 'hello dsh-pocket\n'.length);
 });
 
@@ -123,6 +125,18 @@ test('fileRead 缺少路径 / 文件不存在 / 目录 均报错', async () => {
   assert.equal(nodir.ok, false, '目录应报错');
   const empty = await call(POCKET_ENDPOINTS.fileRead, {});
   assert.equal(empty.ok, false, '缺 path 应报错');
+});
+
+test('fileRead 超过 4MB 的文件直接拒绝（不在主机上整包读进内存）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pocket-fr-'));
+  const file = join(dir, 'big.txt');
+  writeFileSync(file, 'x'.repeat(4 * 1024 * 1024 + 1));
+  const { ctx, call } = makeCtx();
+  installPocketRpc(ctx, { service: { status: async () => ({}) } });
+  const res = await call(POCKET_ENDPOINTS.fileRead, { path: file });
+  assert.equal(res.ok, false, '超过上限应报错');
+  assert.match(res.error?.message ?? '', /过大|too large/i);
+  unlinkSync(file);
 });
 
 test('fileRead 二进制文件报错（不复制无意义文本）', async () => {
