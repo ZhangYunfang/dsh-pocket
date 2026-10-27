@@ -21,8 +21,20 @@ import { selectLanIPv4 } from '../lib/service.mjs';
 
 const require = createRequire(import.meta.url);
 
-/** 自定义密码的最短长度（issue #40：别让人设 `1234`）。 */
-export const MIN_PIN_LENGTH = 6;
+/** 自定义密码的最短长度（issue #40：别让人设 `1234`；与设置页的 8 位下限对齐）。 */
+export const MIN_PIN_LENGTH = 8;
+
+/** 启动前的一致性校验：返回错误文案（null = 通过）。
+ * `--public` + `--no-auth` 是能把「公网域名」直接变成无鉴权入口的组合：
+ * resolvePin 先返回 pin=null，buildAuth(null) 返回 null，代理里 `if (auth)` 整块跳过，
+ * 于是任何知道固定域名的人都能操作 dsh web（= 在宿主机执行代码）。必须阻止启动。 */
+export function cliArgError(args = {}) {
+  if (args.public && args.noAuth) {
+    return '--public 不能与 --no-auth 同时使用：那会让你的固定域名变成无密码的公网入口。'
+      + ' | --public cannot be combined with --no-auth.';
+  }
+  return null;
+}
 
 export function parseArgs(argv) {
   const args = {
@@ -31,6 +43,7 @@ export function parseArgs(argv) {
     public: false,
     upstream: { host: '127.0.0.1', port: 3080 },
     pin: null,
+    pinMissing: false,
     noAuth: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -38,7 +51,18 @@ export function parseArgs(argv) {
     if (a === '--public') args.public = true;
     else if (a === '--port') args.port = Number(argv[++i]) || 3081;
     else if (a === '--host') args.host = argv[++i] ?? '0.0.0.0';
-    else if (a === '--pin') args.pin = String(argv[++i] ?? '');
+    else if (a === '--pin') {
+      // 缺值时要报错，不能把下一个 flag 当成密码：`--pin --public` 曾让
+      // 字面量 "--public" 通过长度校验，同时把 --public 吞掉（用户以为开了公网）。
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        args.pin = '';
+        args.pinMissing = true;
+      } else {
+        args.pin = String(next);
+        i++;
+      }
+    }
     else if (a === '--no-auth') args.noAuth = true;
     else if (a === '--help' || a === '-h') { printHelp(); process.exit(0); }
   }
@@ -59,10 +83,28 @@ export function parseArgs(argv) {
  * 优先级：`--pin` > `DSH_POCKET_PIN` > CSPRNG 随机生成。
  * @returns {{ pin: string|null, source: 'flag'|'env'|'generated'|'disabled', error?: string }}
  */
-export function resolvePin({ pin = null, noAuth = false } = {}, env = {}) {
+export function resolvePin({ pin = null, noAuth = false, pinMissing = false } = {}, env = {}) {
   if (noAuth) return { pin: null, source: 'disabled' };
-  const explicit = pin != null && pin !== '' ? { value: String(pin), source: 'flag' }
-    : (env.DSH_POCKET_PIN ? { value: String(env.DSH_POCKET_PIN), source: 'env' } : null);
+  if (pinMissing) {
+    return {
+      pin: null,
+      source: 'flag',
+      error: '--pin 后面需要一个密码值，不能直接跟别的参数。'
+        + ' | --pin requires a value (did you forget the password?).',
+    };
+  }
+  const rawFlag = pin != null ? String(pin) : '';
+  const rawEnv = env.DSH_POCKET_PIN != null ? String(env.DSH_POCKET_PIN) : '';
+  // 提供了密码但只有空白：不能静默回落到随机密码（用户会以为密码就是那串空格）。
+  if ((rawFlag !== '' && rawFlag.trim() === '') || (rawFlag === '' && rawEnv !== '' && rawEnv.trim() === '')) {
+    return {
+      pin: null,
+      source: rawFlag !== '' ? 'flag' : 'env',
+      error: '访问密码不能只由空白字符组成 | Access password cannot be blank.',
+    };
+  }
+  const explicit = rawFlag !== '' ? { value: rawFlag.trim(), source: 'flag' }
+    : (rawEnv.trim() !== '' ? { value: rawEnv.trim(), source: 'env' } : null);
   if (explicit) {
     if (explicit.value.length < MIN_PIN_LENGTH) {
       return {
@@ -144,6 +186,12 @@ function printQr(url, label) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+
+  const argError = cliArgError(args);
+  if (argError) {
+    console.error(`❌ ${argError}`);
+    process.exit(1);
+  }
 
   const resolved = resolvePin(args, process.env);
   if (resolved.error) {

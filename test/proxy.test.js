@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, request as httpRequest } from 'node:http';
 import { connect } from 'node:net';
+import { createHash } from 'node:crypto';
 import { gzipSync, brotliDecompressSync } from 'node:zlib';
 import { WebSocket, WebSocketServer } from 'ws';
 
@@ -692,6 +693,72 @@ test('访问令牌认证（issue #13）：公网需登录、cookie 放行、局�
   await new Promise((r) => up.close(r));
 });
 
+test('WS 认证 fail-closed（issue #66 的 WS 版）：取不到 PIN 时受保护 Host 必须 5xx，不能 101', async () => {
+  const up = createServer((_req, res) => res.end('upstream'));
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  // getToken 返回 null 模拟「PIN 文件读失败」：HTTP 侧 503 fail-closed，
+  // WS 侧旧实现 `token && !wsAuth.ok` 会整段跳过鉴权直接 101 放行。
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    auth: { getToken: () => null, isProtected: () => true },
+  });
+  try {
+    const line = await new Promise((resolve) => {
+      const sock = connect(proxy.port, '127.0.0.1', () => {
+        sock.write('GET /api/events.mux HTTP/1.1\r\nHost: abc.trycloudflare.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n');
+      });
+      let buf = '';
+      const timer = setTimeout(() => { sock.destroy(); resolve('timeout'); }, 2000);
+      sock.on('data', (c) => {
+        buf += c.toString('latin1');
+        if (buf.includes('\r\n')) { clearTimeout(timer); sock.destroy(); resolve(buf.split('\r\n')[0]); }
+      });
+      sock.on('error', () => { clearTimeout(timer); resolve('error'); });
+    });
+    assert.doesNotMatch(line, /101/, 'WS 不得在缺少 PIN 时放行');
+    assert.match(line, /50[0-9]/, `WS 应 fail-closed（实得 ${line}）`);
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+test('来源分级头由代理重写（客户端伪造无效）；带 ?token= 的 HTML 注入地址栏清理脚本', async () => {
+  const TOKEN = '12345678';
+  const seen = [];
+  const up = createServer((req, res) => {
+    seen.push({ url: req.url, origin: req.headers['x-dsh-pocket-origin'] });
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end('<html><head></head><body>dsh</body></html>');
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    auth: { getToken: () => TOKEN, isProtected: () => true },
+  });
+  try {
+    // 公网 Host + 客户端自称 loopback：代理必须按源地址判成 public。
+    const r = await new Promise((resolve, reject) => {
+      const req = httpRequest({ host: '127.0.0.1', port: proxy.port, path: `/?token=${TOKEN}`, headers: { Host: 'abc.trycloudflare.com', Accept: 'text/html', 'x-dsh-pocket-origin': 'loopback' } }, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    assert.equal(r.status, 200);
+    assert.equal(seen[0].origin, 'public', '入站伪造的 x-dsh-pocket-origin 被丢弃，按源地址重写');
+    assert.doesNotMatch(seen[0].url, new RegExp(TOKEN), '明文 PIN 不进入上游请求行');
+    assert.match(r.body, /data-dsh-pocket-token-scrub="1"/, 'HTML 注入地址栏清理脚本');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
 test('会话保持（issue #33）：登录 cookie 绑定进程 sessionKey，持久 30 天；重启后旧 cookie 失效需重新输入', async () => {
   const http = await import('node:http');
   const { createHash } = await import('node:crypto');
@@ -927,6 +994,10 @@ test('登录速率限制（issue #40 改进版 A）：单 IP 失败达阈值锁�
     const r4 = await login2('10.1.0.100', '00000000'); // 新 IP → 被全局锁拦下
     assert.equal(r4.status, 429, '新 IP 也被全局锁拦截（防换 IP 绕过）');
     assert.ok(r4.body.includes('尝试次数过多'), '全局锁提示');
+    // 全局锁不能变成永久 DoS：攻击者 50 次坏 PIN 后，持有正确密码的机主/新设备
+    // 仍然必须能登录（旧实现连正确密码也一起 429，只有 trustedIps 例外）。
+    const r5 = await login2('10.1.0.101', TOKEN);
+    assert.equal(r5.status, 302, '全局锁期间正确密码仍可登录');
   } finally {
     await proxy2.close();
     await new Promise((r) => up.close(r));
@@ -1502,6 +1573,73 @@ function rawGet(port, path, headers = {}) {
     req.end();
   });
 }
+
+// —— 隐私：分享链接里的明文 PIN 不留在下游任何地方 ——
+
+test('隐私：?token=<PIN> 命中后明文 PIN 不再进上游请求行 / Referer / 访问日志', async () => {
+  // 背景：扫码/分享链接形如 `http://ip:3081/?token=<明文 PIN>`。旧实现种完 cookie 就
+  // 原样转发——PIN 会出现在代理访问日志（`GET /?token=… -> 200`）、上游请求行，以及
+  // 首屏之后每个子资源的 Referer 里（`Referer: http://ip:3081/?token=…`）。日志常被
+  // 贴进 issue，等于把访问密码公开。
+  const PIN = 'pin12345';
+  const SK = 'sess-key';
+  const seen = [];
+  const logs = [];
+  const up = createServer((req, res) => {
+    seen.push({ url: req.url, referer: req.headers.referer });
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body>hi</body></html>');
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    auth: { getToken: () => PIN, isProtected: () => true, sessionKey: SK },
+    log: (line) => logs.push(line),
+  });
+  const hashed = createHash('sha256').update(`${PIN}:${SK}`).digest('hex');
+  const get = (path, headers = {}) => new Promise((resolve, reject) => {
+    const req = httpRequest({ host: '127.0.0.1', port: proxy.port, path, headers: { Host: 'x:3081', Accept: 'text/html', ...headers } }, (res) => {
+      res.resume(); res.on('end', () => resolve({ status: res.statusCode, headers: res.headers }));
+    });
+    req.on('error', reject); req.end();
+  });
+  try {
+    // 1) 首次扫码直达（顺带种 cookie），其他 query 参数要保留
+    const r1 = await get(`/?token=${PIN}&keep=1`);
+    assert.equal(r1.status, 200, '分享链接直达 200');
+    const sc = Array.isArray(r1.headers['set-cookie']) ? r1.headers['set-cookie'].join(';') : String(r1.headers['set-cookie'] ?? '');
+    assert.ok(sc.includes(`dsh_pocket_token=${hashed}`), '仍然照常种认证 cookie');
+
+    // 2) 已种 cookie 后再次打开「收藏的分享链接」——用户每次打开都还带着 PIN
+    const r2 = await get(`/?token=${PIN}`, { Cookie: `dsh_pocket_token=${hashed}` });
+    assert.equal(r2.status, 200, '收藏的分享链接仍可直达');
+
+    // 3) 子资源：浏览器会自动带首屏地址当 Referer
+    const r3 = await get('/assets/a.js', {
+      Referer: `http://192.168.1.5:3081/?token=${PIN}&x=1`,
+      Cookie: `dsh_pocket_token=${hashed}`,
+      Accept: 'text/javascript',
+    });
+    assert.equal(r3.status, 200, '子资源 200');
+
+    for (const hit of seen) {
+      assert.ok(!String(hit.url).includes(PIN), `上游请求行不得出现明文 PIN（实得：${hit.url}）`);
+    }
+    assert.ok(seen.some((h) => h.url === '/?keep=1'), '非 token 的 query 参数必须保留');
+    const asset = seen.find((h) => String(h.url).startsWith('/assets/a.js'));
+    assert.ok(asset, '子资源请求到达上游');
+    assert.ok(!String(asset.referer ?? '').includes(PIN), `Referer 不得带明文 PIN（实得：${asset.referer}）`);
+
+    assert.ok(logs.length > 0, '访问日志有记录');
+    for (const line of logs) {
+      assert.ok(!line.includes(PIN), `访问日志不得出现明文 PIN（实得：${line}）`);
+    }
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
 
 test('慢加载：SW 脚本由代理直出，注册脚本随 DEFAULT_INJECT 注入', async () => {
   const up = await fakeUpstream();

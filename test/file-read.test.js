@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
-import { writeFileSync, mkdtempSync, unlinkSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, unlinkSync, realpathSync } from 'node:fs';
 import { installPocketRpc } from '../lib/web-rpc.js';
 import { POCKET_ENDPOINTS } from '../client/api.js';
 
@@ -35,7 +35,9 @@ test('fileRead 读取真实文件返回正文', async () => {
   const res = await call(POCKET_ENDPOINTS.fileRead, { path: file });
   assert.equal(res.ok, true);
   assert.equal(res.value.content, 'hello dsh-pocket\n');
-  assert.equal(res.value.path, file);
+  // Windows 临时目录可能是 8.3 短名（C:\Users\ADMINI~1\...），而 RPC 返回的是
+  // realpath 长名；用 native realpath 归一后再比，断言两者指向同一文件。
+  assert.equal(realpathSync.native(res.value.path), realpathSync.native(file));
   assert.equal(res.value.size, 'hello dsh-pocket\n'.length);
 });
 

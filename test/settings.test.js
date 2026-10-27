@@ -1,7 +1,7 @@
 // 局域网访问密码开关（issue #24）：默认开启、持久化、可关可开
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, statSync, writeFileSync, readdirSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -384,4 +384,60 @@ test('恢复出厂：设置文件删不掉时 resetPocketState 报 settingsClear
   assert.equal(out.settingsCleared, false, '删除失败必须如实上报，不能吞掉');
   assert.ok(out.warnings.some((w) => w.includes('settings.json')), '告警里要说明是设置文件没删掉');
   assert.ok(out.accessToken.length >= 8, 'PIN 仍然换成新的（内存可用）');
+}));
+
+test('跨进程写入：以磁盘最新内容为基准合并，不用过期缓存覆盖别人刚写的键', () => withHome(async (home) => {
+  // 回归背景：旧 setter 是「读内存缓存（2s TTL）→ 改一个键 → 整份覆盖」。
+  // 桌面版与 dsh web 共用 $DSH_HOME 时，后写者会把先写者的改动擦掉
+  // （审计实测 A 写 lanEnabled=false 最终文件里仍是 true）。
+  const { setMobileFontSize, settingsPath } = await import('../lib/settings.mjs');
+  const file = settingsPath();
+  mkdirSync(join(home, 'dsh-pocket'), { recursive: true });
+  // 模拟另一个进程刚写下的设置：直接改磁盘，绕过本进程缓存
+  writeFileSync(file, JSON.stringify({ lanEnabled: false, lanAuthEnabled: false }, null, 2));
+  setMobileFontSize(16);
+  const raw = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(raw.lanEnabled, false, '别人写的 lanEnabled 不能被覆盖丢失');
+  assert.equal(raw.lanAuthEnabled, false, '别人写的 lanAuthEnabled 也不能丢');
+  assert.equal(raw.mobileFontSize, 16, '本次写入生效');
+}));
+
+test('恢复出厂：连 .tmp/.bak/.lock 派生文件一起清掉（.tmp 可能含 Tunnel Token）', () => withHome(async (home) => {
+  const { setLanEnabled, resetSettings, settingsPath } = await import('../lib/settings.mjs');
+  setLanEnabled(false);
+  const dest = settingsPath();
+  const dir = join(home, 'dsh-pocket');
+  // 模拟崩溃/写失败残留：旧实现的固定 .tmp（可能含 tunnelToken）、备份、锁文件
+  writeFileSync(`${dest}.tmp`, '{"tunnelToken":"secret"}');
+  writeFileSync(`${dest}.bak`, '{"lanEnabled":true}');
+  writeFileSync(`${dest}.lock`, '');
+  writeFileSync(join(dir, 'unrelated.txt'), 'keep me');
+  assert.equal(resetSettings(), true);
+  assert.equal(existsSync(dest), false, 'settings.json 已删除');
+  for (const suffix of ['tmp', 'bak', 'lock']) {
+    assert.equal(existsSync(`${dest}.${suffix}`), false, `.${suffix} 必须一起清掉`);
+  }
+  assert.equal(existsSync(join(dir, 'unrelated.txt')), true, '同目录其它文件不能误删');
+}));
+
+test('PIN 缓存跟随磁盘：另一个实例刷新密码后本实例立即认新值（不再永远认旧值）', () => withHome(async (home) => {
+  // 回归背景：pinCache 只写不失效。桌面版与 dsh web 共用 $DSH_HOME 时，一方刷新
+  // 局域网密码后，另一方仍认旧值——旧密码继续有效、新密码反而登不上。
+  const { tokenForHost } = await import('../lib/index.js');
+  const first = tokenForHost('192.168.1.5:3081');
+  assert.match(first, /^\d{8}$/, '首次访问生成 8 位密码');
+  const file = join(home, 'dsh-pocket', 'token-lan');
+  writeFileSync(file, 'AnotherPIN7'); // 模拟另一个实例写入新密码
+  const future = new Date(Date.now() + 2_000);
+  utimesSync(file, future, future); // mtime 必须比缓存记录的新
+  assert.equal(tokenForHost('192.168.1.5:3081'), 'AnotherPIN7',
+    '必须跟随磁盘上的新密码，否则旧密码继续有效、新密码登不上');
+}));
+
+test('PIN 原子写：不残留 .tmp 临时文件，写入后立即可读', () => withHome(async (home) => {
+  const { setCustomPin, getAccessToken } = await import('../lib/index.js');
+  assert.equal(setCustomPin('public', 'AtomicPIN9'), 'AtomicPIN9');
+  const leftovers = readdirSync(join(home, 'dsh-pocket')).filter((n) => n.endsWith('.tmp'));
+  assert.deepEqual(leftovers, [], '原子写不应留下临时文件');
+  assert.equal(getAccessToken(), 'AtomicPIN9', '写入后立即生效');
 }));

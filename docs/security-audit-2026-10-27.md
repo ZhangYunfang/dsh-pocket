@@ -1,0 +1,67 @@
+# 2026-10-27 全面安全/稳定性审计记录
+
+本轮审计目标：找出 dsh-pocket 既有功能里的**内存泄露、隐私泄露、边界 bug、网络安全漏洞、联动 bug**，用「多子代理并行审查 + 对抗验证 + 回归测试」的方式修复确认项。
+
+## 方法
+
+1. 6 个只读子代理按模块并行审查（proxy / web-rpc + delete-session / 生命周期与供应链 / 客户端设置页 / 移动端 / 跨模块契约与测试假阳性），输出「严重度 / 位置 / 证据 / 触发 / 影响 / 现有测试为何没发现 / 最小修法」。
+2. 对高危项再派对抗验证代理逐条复核（能否复现、是否已有测试覆盖、修法是否破坏契约），只修「确认」项；被驳回的写入下方「明确不修」并给出理由。
+3. 每项修复补回归测试，最后跑全量测试。
+
+## 已修复（按风险）
+
+### 认证 / 授权
+
+- **`?token=` 明文 PIN 泄漏**：分享链接里的 PIN 会进入上游请求行、子资源 `Referer`、代理访问日志。现在认证通过后按值（只删等于访问 PIN 的 `token` 参数，绝不误删 dsh 启动 token）从请求行剥离；`Referer` 改写时去掉 `token`；所有错误/访问日志统一走 `maskTokenForLog`；HTML 注入点加 `history.replaceState` 清掉手机地址栏的 query（Safari 在 `http://` 源上不能靠 3xx 保 cookie，所以不用重定向）。
+- **全局登录锁把主人也锁在门外**（未认证即可 DoS）：限速器区分「单 IP 锁」与「全局锁」；全局锁只拦继续猜密码的请求，**正确密码始终放行**，登录页/`?token=`/WS 三条路径一致。
+- **WS fail-open**：受保护主机上 `getToken()` 为空时，HTTP 503 而 WS 仍 101。现在 WS 与 HTTP 对齐 fail-closed，并复用单 IP 锁。
+- **公网 PIN 跨通道回显**：`status` 曾把公网 PIN 返回给任何已认证客户端（含 LAN/公网），等于给出「离网可用、不随启停更换」的持久凭据。现在代理写入 `x-dsh-pocket-origin`（客户端伪造会被丢弃），仅 `loopback` 返回公网 PIN；**局域网 PIN 也不回传公网来源**。
+- **公网访客可操作本机/局域网通道**：通过隧道访问时，`lan.refresh` / `lanAuth.setEnabled` / `lan.setEnabled` / `lan.setOverride` / `pin.setCustom('lan')` / `pocket.reset` / `tunnel.start|stop|setConfig` 一律 `forbidden`；设置页按 `status.origin` 隐藏对应控件，服务端仍强制校验。
+- **CLI 参数**：`MIN_PIN_LENGTH` 与插件统一为 8；`--public` + `--no-auth` 直接拒绝启动；`--pin` 缺值/下一个参数是 flag 时不再吞掉它；纯空白 PIN 报错。
+- **删除会话路由信任栅栏**：改用宿主 `connection.requestRejection`（含浏览器认证），没有该方法才回退 Host/Origin 检查；权限/跨源头分别回 401/403。
+
+### 内存 / 解压炸弹
+
+- **`POST /api/session/list` 请求体无上限**（单请求可涨 ~150MB）：`content-length` 预检 + 边收边计数，超 1MB 直接改成流式转发，不在代理里攒整包。
+- **session/list 响应全量缓冲/解压/重压**：`content-length` 预检 + 64MB 上限，超限流式透传；解压一律带 `maxOutputLength`。
+- **HTML 注入分支可被解压炸弹打爆**：4MB 预检、边收边计数超限即 `pipe` 直通、`gunzip/brotli/inflate` 全部 `maxOutputLength`。
+
+### 路径 / 文件
+
+- **fileRead 工作区边界 fail-open**：工作区枚举失败/返回空/形状异常时旧代码把 `roots=[]` 当「无边界」放行。现在无法确定边界就拒绝（fail-closed），并扩充凭据黑名单（`deploy_key`、`gcp-service-account.json`、`*.ppk`、`*.kdbx`、`hosts.yml`、`.docker/config.json` 等）；非字符串 path 直接 400；错误文案不再回显绝对路径/用户名。
+- **delete-session**：`cwd === ''` 抛异常变成空 400 已修成明确的 400；失败文案不再与回滚事实相反；错误/日志里的会话 id 截断（防 900KB 的 id 放大成 900KB 响应、防换行注入）；`isInside` 补 `!isAbsolute(rel)`。
+
+### 生命周期 / 配置
+
+- **settings 跨进程读-改-写互相覆盖**：加 `settings.json.lock`（10s 视为陈旧）、每次写入前重读磁盘再合并、临时文件名加 pid+随机串；`resetSettings` 清掉 `.bak/.tmp/.lock`，不再把含 `tunnelToken` 的 `.tmp` 留在盘上。PIN 写盘改为原子 rename，`pinCache` 按 mtime 失效。
+- **两实例共用 `$DSH_HOME` 时互杀隧道**：`tunnel-auto.json` 记录 `hostPid`；宿主仍存活时孤儿清扫直接跳过，只清理真正遗留的 cloudflared。
+- **代理端口被占静默顺延**：`status.portShifted` 暴露事实；命名隧道 ingress 指向原端口时 `startTunnel` 直接拒绝并提示改端口或改 ingress，不再公网 502/命中别的实例。
+- **隧道运行中改配置不重启**：保存后若隧道在跑则用新配置重启一次，`status` 不再同时给「旧 tunnelUrl + 新 hostname」。
+- **更新超时只杀 cmd.exe**：Windows 改用 `taskkill /T /F` 杀整棵进程树；profile 缺省按安装路径推断，不再写死 `'web'`。
+- **停止隧道后 pid 永久留在 `spawnedPids`**：主动停止也先摘 pid；重启辅助进程改用宿主实际端口。
+
+### 供应链
+
+- cloudflared 的 macOS 清华 bottle 源从 `verifyDigest:false` 改为「Homebrew API 取 sha256 后校验」；拿不到 digest 时显式告警只做尺寸校验（此前完全跳过）。
+
+### 客户端 / 移动端
+
+- 设置页：`withPending` 改引用计数（共用 `'prefs'` 时不再提前解锁）、所有 fetch 加超时、`waitForHostThenReload` 可中断（卸载/超时不再永久卡死或迟到 reload）、Esc 不冒泡一次关两层、PIN 输入框补 `autoComplete/name` 并对被过滤字符给出提示、错误文案走 locale。
+- 移动端：焦点陷阱遇到「弹层对象替换」不再当成关闭（否则新弹层要等下一次 DOM 突变才有焦点约束）；注入的「复制文件」按钮与链接用 id 绑定，React 重建行时清理失配旧按钮，避免长会话里越积越多。
+
+## 明确不修（附理由）
+
+- **`isLoopback` 被硬编码为 true**：真正机制是代理注入的 transport shim 把 `ownsHost` 置 true；该字段只是旧宿主兜底、项目文档自认是 UI 开关，PIN 持有者等同本机操作者是设计承诺（README 安全章节已写明）。
+- **局域网 HTTP 无法给 cookie 加 `Secure`**：`http://IP` 源上加了 `Secure` 浏览器不回传，登录直接坏；改成 HTTPS 需要证书/域名，超出插件范围。已在 README 提示「不可信 WiFi 改用 HTTPS 隧道」。
+- **公网访客改自己的公网 PIN**：它本来就有 DSH 全权（可执行代码读 PIN 文件），加门禁属安全剧场；局域网 PIN 的跨通道操作已封。
+- **Windows `mode:0o600` 是空操作**：Node 在 Windows 不支持 POSIX 权限位，实际取决于 `$DSH_HOME` 的 NTFS ACL；已在 README 说明。
+- **移动端上游 vendored 代码的 4 条 low/medium**（`style` scope 每帧唤醒、swipe disposer 结算、drawer Escape 全局判定、focus shadow 单例）：均来自 dsh-web-mobile 的上游实现，改动会在下次同步时冲突；本轮只修了 pocket 自己写的两处（F1/F3），其余记入待上游同步。
+
+## 验证
+
+- `node --test --test-timeout=30000 "test/*.test.js"`：**286 tests / 284 pass / 0 fail / 2 skipped**。
+- 关键回归用例：`?token=` 三处脱敏、HTML 地址栏清理脚本、WS 认证 fail-closed、全局锁期间正确密码可登录、来源分级头不可伪造、status 的 accessToken/lanToken 按来源返回、公网来源 forbidden 矩阵、fileRead 边界 fail-closed、删除路由信任栅栏、settings 跨进程合并与恢复出厂清派生文件、孤儿 cloudflared 不误杀活实例、端口顺延拒绝开公网。
+
+## 复现脚本
+
+审计期的探针脚本在 `%TEMP%`（未入库）：`probe-token-leak*.mjs`（PIN 泄漏）、`probe-ads.mjs`（NTFS ADS）、`probe-abort2.mjs`（上游中断行为）；代理审计的 `a1..a4.mjs`、fileRead/删除路由的 `fr2.mjs`/`droute.mjs` 等在 `C:\Users\Public\dsh-pocket-audit\`。

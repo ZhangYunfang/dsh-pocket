@@ -962,13 +962,15 @@ test('tsinghuaBottleUrl：按平台/架构匹配清华 bottle（Windows 无匹�
   try {
     // Windows：无 Homebrew bottle → null
     assert.equal(await tsinghuaBottleUrl({ os: 'windows', a: 'amd64' }), null, 'Windows 不走清华');
-    // macOS arm64 → 清华 arm64_ 开头的 bottle URL
-    const macUrl = await tsinghuaBottleUrl({ os: 'darwin', a: 'arm64' });
-    assert.ok(macUrl && macUrl.includes('mirrors.tuna.tsinghua.edu.cn'), 'macOS 有清华 URL: ' + macUrl);
-    assert.ok(/arm64_(sequoia|sonoma|tahoe)\.bottle\.tar\.gz$/.test(macUrl), '匹配 arm64 macOS bottle: ' + macUrl);
+    // macOS arm64 → 清华 arm64_ 开头的 bottle URL + Homebrew tag（查校验和要用）
+    const macBottle = await tsinghuaBottleUrl({ os: 'darwin', a: 'arm64' });
+    assert.ok(macBottle?.url?.includes('mirrors.tuna.tsinghua.edu.cn'), 'macOS 有清华 URL: ' + macBottle?.url);
+    assert.ok(/arm64_(sequoia|sonoma|tahoe)\.bottle\.tar\.gz$/.test(macBottle.url), '匹配 arm64 macOS bottle: ' + macBottle.url);
+    assert.match(macBottle.tag, /^arm64_(sequoia|sonoma|tahoe)$/, 'tag 必须带 arm64_ 前缀（Homebrew API 的键）');
     // macOS Intel → 无 arm64 前缀的 bottle
-    const intelUrl = await tsinghuaBottleUrl({ os: 'darwin', a: 'amd64' });
-    assert.ok(intelUrl && !/arm64_/.test(intelUrl), 'Intel 用无前缀 bottle: ' + intelUrl);
+    const intelBottle = await tsinghuaBottleUrl({ os: 'darwin', a: 'amd64' });
+    assert.ok(intelBottle?.url && !/arm64_/.test(intelBottle.url), 'Intel 用无前缀 bottle: ' + intelBottle?.url);
+    assert.match(intelBottle.tag, /^(sequoia|sonoma|tahoe|monterey|ventura)$/, 'Intel tag 不带前缀');
     // Linux：Homebrew bottle 的 ELF 解释器是占位符，不能直接用 → 跳过清华（issue #22）
     assert.equal(await tsinghuaBottleUrl({ os: 'linux', a: 'arm64' }), null, 'Linux 不走清华（Homebrew bottle 不可用）');
   } finally {
@@ -1035,6 +1037,31 @@ test('startProxy：端口被占（EADDRINUSE）时自动尝试下一个端口', 
   await service.dispose();
 });
 
+test('startTunnel：代理因端口占用顺延后拒绝开公网（ingress 指向原端口会 502 或命中别的实例）', async () => {
+  let attempts = 0;
+  const internals = {
+    ...stubInternals(),
+    createProxy: async ({ port: p }) => {
+      attempts += 1;
+      if (attempts === 1) {
+        const e = new Error('address in use');
+        e.code = 'EADDRINUSE';
+        throw e;
+      }
+      return { port: p, close: async () => {} };
+    },
+  };
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
+  try {
+    await service.startProxy();
+    await assert.rejects(() => service.startTunnel(), /3082[\s\S]*ingress|ingress[\s\S]*3082/, '必须拦住而不是静默 502');
+    const st = await service.status();
+    assert.equal(st.portShifted, true, 'status 暴露端口顺延，UI 才能提示');
+  } finally {
+    await service.dispose();
+  }
+});
+
 for (const [label, mode, cfg, shouldRestore] of [
   ['旧无 mode 标记 + 无配置', undefined, undefined, false],
   ['旧无 mode 标记 + 旧 quick 配置', undefined, namedTunnelConfig({ mode: 'quick' }), false],
@@ -1090,6 +1117,40 @@ for (const [label, mode, cfg, shouldRestore] of [
     }
   }));
 }
+
+test('孤儿清扫：marker 属于仍存活的另一个实例时绝不杀它的隧道', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dshp-orphan-'));
+  const dir = join(home, 'dsh-pocket');
+  mkdirSync(dir, { recursive: true });
+  const statePath = join(dir, 'tunnel-auto.json');
+  const killed = [];
+  const internals = {
+    ...stubInternals(),
+    isProcessAlive: (pid) => pid === 7777, // 7777 是「另一个还活着的 DSH 实例」
+    isOrphanCloudflared: async () => true,
+    killPid: async (pid) => { killed.push(pid); },
+  };
+  const service = createPocketService({
+    dshPort: 3080, port: 3081, home, internals,
+    // 不合格配置 → restore 走 killOrphanCloudflared + clearAutoTunnel 分支
+    getTunnelConfig: () => ({ mode: 'named', token: '', hostname: '' }),
+    log: { info() {}, warn() {} },
+  });
+  try {
+    writeFileSync(statePath, JSON.stringify({ at: Date.now(), mode: 'named', pid: 4242, hostPid: 7777 }));
+    await service.restoreTunnelIfNeeded();
+    assert.deepEqual(killed, [], '宿主仍存活时不能把它正在用的 cloudflared 当孤儿杀掉');
+    assert.equal(existsSync(statePath), false, '不合格的恢复标记仍要清掉');
+
+    // 宿主已死：允许清扫上次遗留的 cloudflared
+    writeFileSync(statePath, JSON.stringify({ at: Date.now(), mode: 'named', pid: 4242, hostPid: 8888 }));
+    await service.restoreTunnelIfNeeded();
+    assert.deepEqual(killed, [4242], '宿主已死的 marker 才允许清扫');
+  } finally {
+    await service.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
 test('公网隧道自动恢复：开启时持久化标记，重启后 restoreTunnelIfNeeded 自动拉起（issue #11）', async () => {
   const fsp = await import('node:fs/promises');
@@ -1201,6 +1262,7 @@ test('RPC：局域网密码独立于公网；lanTokenRefresh 刷新并返回新�
     getToken: () => '99999999',
     getLanToken: () => lan,
     refreshLanToken: () => { lan = '22222222'; return lan; },
+    setCustomPin: (_which, value) => value,
     log: { error() {}, warn() {} },
   });
   await service.startProxy();
@@ -1214,6 +1276,41 @@ test('RPC：局域网密码独立于公网；lanTokenRefresh 刷新并返回新�
   assert.equal(r.value.lanToken, '22222222', '刷新返回新密码');
   const s2 = await conn.handler(POCKET_ENDPOINTS.status, {});
   assert.equal(s2.value.lanToken, '22222222', 'status 反映新密码');
+
+  // 来源分级：公网 PIN 只回给本机（loopback）客户端。LAN/公网客户端拿到
+  // accessToken 等于拿到一条离网也能用、且不随启停更换的持久通道（审计 F3）。
+  const sLan = await conn.handler(POCKET_ENDPOINTS.status, {}, undefined, 'lan');
+  assert.equal(sLan.value.accessToken, null, 'LAN 客户端不回显公网 PIN');
+  const sPub = await conn.handler(POCKET_ENDPOINTS.status, {}, undefined, 'public');
+  assert.equal(sPub.value.accessToken, null, '公网客户端不回显公网 PIN');
+  // 局域网 PIN 同理：公网访客拿到它就能在同一 WiFi 下直连局域网入口。
+  assert.equal(sLan.value.lanToken, '22222222', 'LAN 客户端可看到局域网 PIN');
+  assert.equal(sPub.value.lanToken, null, '公网客户端不回显局域网 PIN');
+  const sLocal = await conn.handler(POCKET_ENDPOINTS.status, {}, undefined, 'loopback');
+  assert.equal(sLocal.value.accessToken, '99999999', '本机客户端仍可看到公网 PIN');
+  assert.equal(sLocal.value.lanToken, '22222222', '本机客户端仍可看到局域网 PIN');
+
+  // 公网通道不能操作局域网通道：刷新/开关/自定义密码/绑定地址都必须拒绝。
+  for (const [endpoint, payload] of [
+    [POCKET_ENDPOINTS.lanTokenRefresh, {}],
+    [POCKET_ENDPOINTS.lanAuthSetEnabled, { on: false }],
+    [POCKET_ENDPOINTS.lanSetEnabled, { on: false }],
+    [POCKET_ENDPOINTS.lanSetOverride, { ip: '192.168.1.9' }],
+    [POCKET_ENDPOINTS.pinSetCustom, { which: 'lan', value: '33333333' }],
+    [POCKET_ENDPOINTS.pocketReset, { confirm: true }],
+    [POCKET_ENDPOINTS.tunnelStart, { disclaimer: true }],
+    [POCKET_ENDPOINTS.tunnelStop, {}],
+    [POCKET_ENDPOINTS.tunnelSetConfig, { mode: 'named', hostname: 'evil.example.com' }],
+  ]) {
+    const r = await conn.handler(endpoint, payload, undefined, 'public');
+    assert.equal(r.ok, false, `公网来源必须拒绝 ${endpoint}`);
+    assert.equal(r.error.code, 'forbidden', `公网来源拒绝 ${endpoint} 时用 forbidden`);
+  }
+  assert.equal(sPub.value.origin, 'public', 'status 暴露来源分级给前端');
+  assert.equal(sLocal.value.origin, 'loopback', 'status 暴露来源分级给前端（本机）');
+  // 局域网来源改自己的密码仍然允许（它本来就是局域网的主人）。
+  const lanOwn = await conn.handler(POCKET_ENDPOINTS.pinSetCustom, { which: 'lan', value: '33333333' }, undefined, 'lan');
+  assert.equal(lanOwn.ok, true, '局域网来源可以改局域网密码');
 
   await service.dispose();
 });

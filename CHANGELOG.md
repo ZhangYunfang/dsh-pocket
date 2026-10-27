@@ -1,3 +1,28 @@
+## [Unreleased]（2026-10-27 全面审计）
+
+> 完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。
+
+### Security
+
+* **proxy:** `?token=` 认证通过后从上游请求行 / 子资源 `Referer` / 访问日志中剥离明文 PIN，并在首屏 HTML 注入 `history.replaceState` 清掉地址栏里的密码
+* **proxy:** 限速器区分单 IP 锁与全局锁——全局锁期间正确密码仍可登录，未认证请求不能再靠打满失败次数把主人永久锁在门外；WS 认证与 HTTP 对齐 fail-closed
+* **proxy:** 认证后按不可伪造来源（loopback/lan/public）写入 `x-dsh-pocket-origin`；`status` 只向 loopback 回传公网 PIN、不向公网回传局域网 PIN
+* **rpc:** 公网来源禁止刷新/开关局域网、禁止改隧道配置与启停隧道、禁止恢复出厂（服务端 `forbidden`，设置页同步隐藏）
+* **rpc:** fileRead 工作区边界改为 fail-closed（枚举失败/为空/形状异常一律拒绝），扩充凭据黑名单，非字符串路径 400，错误文案不再回显绝对路径
+* **delete:** 删除路由改用宿主 `connection.requestRejection`（含浏览器认证），无该方法才回退 Host/Origin 检查
+* **bin:** CLI 与插件统一 8 位 PIN 下限；拒绝 `--public` + `--no-auth`；`--pin` 缺值不再吞掉下一个 flag；纯空白 PIN 报错
+* **tunnel:** macOS 清华 bottle 源改为用 Homebrew API 的 sha256 校验，拿不到 digest 时显式告警（此前该源完全跳过校验）
+
+### Bug Fixes
+
+* **proxy:** 给 `session/list` 请求体与响应、HTML 注入分支加缓冲上限/解压上限，避免单请求让宿主涨 150MB 级内存或被解压炸弹打爆
+* **settings:** 恢复出厂清掉 `.bak/.tmp/.lock`，不再残留含 `tunnelToken` 的临时文件
+* **service:** `tunnel-auto.json` 记录宿主 pid，孤儿清扫不再误杀共用 `$DSH_HOME` 的另一个实例正在用的 cloudflared；端口顺延后拒绝开公网；主动停止隧道时同步摘掉 spawnedPids
+* **index:** PIN 原子写 + 按 mtime 失效缓存；更新超时用 `taskkill /T` 杀整棵进程树；fork 守卫校验 registry 响应状态，探测失败不再放行覆盖本地 fork
+* **restart:** 交接辅助进程使用宿主实际端口，不再因 argv 缺 `--port` 回退 3080 白等 20s
+* **client:** `withPending` 引用计数、fetch 超时、`waitForHostThenReload` 可中断、Esc 不冒泡；PIN 输入框补 autocomplete 并对被过滤字符提示
+* **mobile:** 弹层被替换时焦点陷阱直接迁移而不是当成关闭；文件复制按钮与链接绑定 id，React 重建后清理失配按钮
+
 ## [3.0.3](https://github.com/daha1216/dsh-pocket/compare/v3.0.2...v3.0.3) (2026-10-27)
 
 > 3.0.0–3.0.2 是 named-only 安全加固线（关闭 semantic-release 的 npm 发布后未再生成条目），本版起恢复手写记录。

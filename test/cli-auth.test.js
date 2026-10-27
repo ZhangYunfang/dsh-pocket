@@ -20,6 +20,7 @@ import {
   buildAuth,
   entryUrl,
   resolvePublicConfig,
+  cliArgError,
   MIN_PIN_LENGTH,
 } from '../bin/dsh-pocket.mjs';
 
@@ -53,14 +54,38 @@ test('issue #90：--pin / DSH_POCKET_PIN 可自定义，优先级 flag > env > �
 });
 
 test(`issue #90：自定义密码短于 ${MIN_PIN_LENGTH} 位必须被拒，不能静默接受弱口令`, () => {
-  for (const weak of ['1', '12', '1234', '12345']) {
+  for (const weak of ['1', '12', '1234', '123456', '1234567']) {
     const r = resolvePin(parseArgs(['--pin', weak]), {});
     assert.equal(r.pin, null, `${weak} 应被拒绝`);
     assert.ok(r.error, `${weak} 应给出错误说明`);
     assert.match(r.error, new RegExp(String(MIN_PIN_LENGTH)));
   }
   // 刚好达到下限则接受
-  assert.equal(resolvePin(parseArgs(['--pin', '123456']), {}).pin, '123456');
+  assert.equal(resolvePin(parseArgs(['--pin', '12345678']), {}).pin, '12345678');
+  // 前后空白不该被当作密码的一部分（否则用户永远敲不进去）
+  assert.equal(resolvePin(parseArgs(['--pin', '  12345678  ']), {}).pin, '12345678');
+  // 纯空白不是密码
+  assert.ok(resolvePin(parseArgs(['--pin', '        ']), {}).error);
+});
+
+test('issue #90 回归：--pin 缺值时必须报错，不能把下一个 flag 当成密码', () => {
+  // 旧实现 `--pin --public` 会把字面量 "--public"（8 字符）当密码，同时吞掉 --public，
+  // 用户以为开了公网、实际没开。
+  const swallowed = parseArgs(['--pin', '--public']);
+  assert.equal(swallowed.pin, '');
+  assert.equal(swallowed.pinMissing, true);
+  assert.equal(swallowed.public, true, '--public 仍要被解析（不能被当作 --pin 的值吞掉）');
+  const r = resolvePin(swallowed, {});
+  assert.equal(r.pin, null);
+  assert.match(String(r.error), /--pin/);
+});
+
+test('CLI：--public 与 --no-auth 同时出现必须拒绝启动（公网 + 无鉴权 = 裸奔）', () => {
+  assert.match(String(cliArgError(parseArgs(['--public', '--no-auth']))), /--no-auth/);
+  // 单独用任何一个都不该被这条规则拦下
+  assert.equal(cliArgError(parseArgs(['--public'])), null);
+  assert.equal(cliArgError(parseArgs(['--no-auth'])), null);
+  assert.equal(cliArgError(parseArgs([])), null);
 });
 
 test('issue #90：--no-auth 是显式 opt-out —— 只有它能让 auth 为空', () => {
