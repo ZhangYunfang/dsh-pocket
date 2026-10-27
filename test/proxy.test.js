@@ -2053,3 +2053,128 @@ test('隧道流量：loopback 源 + Cloudflare 边缘头时，Host 伪装成本�
     await new Promise((r) => up.close(r));
   }
 });
+
+// —— 第四轮对抗审查回归（a4a70e47）：未保护 Host 的 PIN 剥离 / 303 过渡页 / 304 / 空 token / IPv4-mapped ——
+
+test('隐私：auth 已配置但 Host 不受保护时，分享链接里的 PIN 也不得转给上游', async () => {
+  // F1：旧实现只在 protectedHost 分支构造 acceptedTokens，不受保护的 Host（本机入口、
+  // 或关掉局域网密码）上 token 为 null → stripPocketToken 拿到空列表直接 return，
+  // 于是 `GET /?token=<PIN>` 把明文密码原样写进上游访问日志。不认证不等于可以转发密码。
+  const PIN = 'pin12345';
+  const seen = [];
+  const up = createServer((req, res) => {
+    seen.push(req.url);
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('ok');
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    // 本机入口：isProtected=false，不要求密码；但 PIN 仍不该被当普通参数转发
+    auth: { getToken: () => PIN, isProtected: () => false, sessionKey: 'sk' },
+  });
+  try {
+    const res = await rawGet(proxy.port, `/?token=${PIN}&keep=1`, { Accept: 'text/html' });
+    assert.equal(res.status, 200);
+    assert.deepEqual(seen, ['/?keep=1'], `不受保护的 Host 也要摘掉 PIN，实际: ${JSON.stringify(seen)}`);
+    assert.ok(!String(seen[0]).includes(PIN), '上游不得看到明文 PIN');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+test('隐私：launch token 的 303 过渡页也要带地址栏清理脚本，且不保留上游 content-encoding', async () => {
+  // F2 + F8：issue #91 的过渡页直接发 handshakePageHtml()，没有 scrub 脚本 → PIN 留在历史；
+  // 同时旧实现保留上游 303 的 content-encoding（gzip），浏览器按 gzip 解明文过渡页 → 白屏。
+  const PIN = 'pin12345';
+  const up = createServer((req, res) => {
+    const body = gzipSync(Buffer.from('redirecting', 'utf8'));
+    res.writeHead(303, {
+      location: '/',
+      'content-type': 'text/html; charset=utf-8',
+      'content-encoding': 'gzip',
+      'content-length': String(body.length),
+    });
+    res.end(body);
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    auth: { getToken: () => PIN, isProtected: () => true, sessionKey: 'sk' },
+    launchToken: () => 'LAUNCHTOK', // 触发 launch token 注入 → 上游 303 → 过渡页分支
+  });
+  try {
+    const res = await rawGet(proxy.port, `/?token=${PIN}`, { Accept: 'text/html' });
+    assert.equal(res.status, 200, '303 被改写为 200 过渡页（Safari 不保存 3xx 的 cookie）');
+    assert.equal(res.headers['content-encoding'], undefined, '明文过渡页不能带 content-encoding');
+    assert.equal(res.headers.location, undefined, '不把 303 留给浏览器重做');
+    const html = res.body.toString('utf8');
+    assert.match(html, /data-dsh-pocket-token-scrub/, '过渡页也要注入历史清理脚本');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+test('注入分支不碰 304/204：缓存验证器与 content-length 不得被改写', async () => {
+  // F3：304 没有正文，旧实现仍跑 HTML 注入 → 写出与实际不符的 content-length、
+  // 并清掉 etag/last-modified（缓存验证器）。
+  const up = createServer((req, res) => {
+    res.writeHead(304, { etag: '"abc123"', 'content-type': 'text/html; charset=utf-8' });
+    res.end();
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+  });
+  try {
+    const res = await rawGet(proxy.port, '/', { Accept: 'text/html', 'if-none-match': '"abc123"' });
+    assert.equal(res.status, 304);
+    assert.equal(res.headers.etag, '"abc123"', '304 的 etag 必须保留');
+    assert.equal(res.headers['content-length'], undefined, '304 不能凭空写出 content-length');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+test('限速：空的 ?token= / ?token 不算密码尝试，不能把出口 IP 锁死', async () => {
+  // F4：旧实现 hasQueryToken 只看键存在 → `?token=` 空值也计数，共享 NAT 里 5 个
+  // 截断链接/扫描器就能让整个出口 IP 锁 60s。这里把单 IP 阈值降到 1，验证空值不计数。
+  const PIN = 'pin12345';
+  const up = createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('ok');
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    auth: { getToken: () => PIN, isProtected: () => true, sessionKey: 'sk' },
+    rateLimit: { maxFailures: 1, globalMaxFailures: 100, lockMs: 60_000, globalLockMs: 60_000 },
+  });
+  try {
+    for (const path of ['/?token=', '/?token']) {
+      const empty = await rawGet(proxy.port, path, { Accept: 'text/html' });
+      assert.notEqual(empty.status, 429, `空 token 不应触发锁定（${path}）`);
+    }
+    const ok = await rawGet(proxy.port, `/?token=${PIN}`, { Accept: 'text/html' });
+    assert.equal(ok.status, 200, '空 token 没有消耗失败预算，正确 PIN 仍应直达');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+test('classifyHost：IPv4-mapped IPv6 字面量按嵌入的 IPv4 分类', () => {
+  // F6：`::ffff:127.0.0.1` 是双栈环境下浏览器可能给出的本机字面量，旧实现当陌生域名 →
+  // protected 模式下本机访问反而要公网 PIN。
+  assert.equal(classifyHost('::ffff:127.0.0.1'), 'loopback');
+  assert.equal(classifyHost('[::ffff:127.0.0.1]:3081'), 'loopback');
+  assert.equal(classifyHost('::ffff:192.168.1.9'), 'lan');
+  assert.equal(classifyHost('::ffff:203.0.113.9'), 'public');
+});

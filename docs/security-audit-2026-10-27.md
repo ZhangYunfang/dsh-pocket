@@ -75,6 +75,17 @@
 - **pnpm 布局**：`inferProfile` 支持 `.pnpm/<pkg>@<ver>/node_modules`，一键更新不再错误地打到 `web` profile。
 - **边界**：主文件为 `[]` 时视为损坏并回退 `.bak`；stale 锁删掉后仍检查等待截止时间；完全缺 `webServer` 时也打印回退告警；移动端弹层替换不再丢弃 opener（关闭后焦点回到触发按钮）；README 中英补充「手工删配置前先删 `.bak`」。
 
+### 第五轮追加（同日，proxy 安全回归验证）
+
+第五轮只读子代理从 48b5ea9 起逐项证伪第三轮 proxy 加固（22 种 token 变体、隧道/反代强制公网、源地址下限、`allowCompare` 接线、注入 206/4MB/压缩/无 `<head>`），确认无 high、无认证绕过、无 XSS；同时找出 4 个 low（其中 2 个是「修复未闭合的分支」）与 5 条信息，已修：
+
+- **未保护 Host 的 PIN 剥离**（low）：`auth` 已配置但 `isProtected()=false`（本机入口、或关掉局域网密码）时，旧实现只在 protected 分支构造剥离列表 → `GET /?token=<PIN>` 的明文密码进入上游请求行/日志；HTTP 与 WS 都补齐，不认证不等于可以转发密码。
+- **303 过渡页的地址栏清理**（low）：issue #91 的握手过渡页直接发 `handshakePageHtml()`，没有 scrub 脚本，PIN 留在浏览器历史；现在按 `__pocketTokenScrubbed` 注入。
+- **303 分支的 `content-encoding`**（信息，pre-existing）：上游 303 带 gzip 时，明文过渡页被浏览器按 gzip 解码 → `ERR_CONTENT_DECODING_FAILED` 白屏；现在删除该头。
+- **注入分支跳过 204/304**（low）：无正文响应不再被注入，避免不实 `content-length` 与丢失 `etag`/`last-modified`。
+- **空 `?token` 不计数**（low）：`?token` / `?token=` 空值不再计为一次密码尝试，扫描器/截断链接不能把共享出口 IP 锁 60 秒。
+- **IPv4-mapped IPv6**（信息）：`::ffff:127.0.0.1` 按嵌入的 IPv4 分类，protected 模式下本机访问不再要公网 PIN；WS 上游补 `x-dsh-pocket-origin` 与 HTTP 对齐。
+
 ## 明确不修（附理由）
 
 - **`isLoopback` 被硬编码为 true**：真正机制是代理注入的 transport shim 把 `ownsHost` 置 true；该字段只是旧宿主兜底、项目文档自认是 UI 开关，PIN 持有者等同本机操作者是设计承诺（README 安全章节已写明）。
@@ -88,12 +99,13 @@
 
 - 来源分级依赖代理写入的 `x-dsh-pocket-origin`，而该头只在 dsh 提供 `webServer`（0.1.5+）走 HTTP 挂载时才能带到宿主。更老的 dsh 会回退到 `connection.rpc.handle` 通道，此时 handler 拿不到请求上下文，一律按 loopback 处理——这类宿主上「公网访客看不到局域网/公网 PIN」的加固不生效（但公网入口的 PIN 校验本身仍由代理负责）。回退时会打 warn 指明降级原因。能过公网 PIN 校验的人本来就可以让 DSH 执行本机代码，「设置页权限 = 本机」与 README 的既有承诺一致，因此不再用「无法区分的来源」去猜。
 - 上游中断（origin 半路断开）时，代理会选择销毁客户端连接而不是转发半截正文：这是有意的（避免把不完整内容当成正常响应），代价是浏览器看到 `socket hang up`；移动端会重试。
+- **限速的取舍**：单 IP 锁（60s）期间连正确 PIN 也拒绝——否则锁定窗口就是一次免费穷举窗口；全局锁期间正确 PIN 仍可登录，但比较本身受 `allowCompare` 预算（突发 10、每 100ms 补 1）约束，持续 ≥10 次/秒的攻击下合法无 cookie 用户可能间歇拿到 429（≤30s）。空 `?token` 已不计数，减少共享出口 IP 被误锁的概率。
 
 ## 验证
 
-- `node --test --test-timeout=30000 "test/*.test.js"`：**300 tests / 298 pass / 0 fail / 2 skipped**（2 个 skip 为跨平台占位用例）。
+- `node --test --test-timeout=30000 "test/*.test.js"`：**305 tests / 303 pass / 0 fail / 2 skipped**（2 个 skip 为跨平台占位用例）。
 - `npm run test:local`（真机 + 真实 Cloudflare 隧道）未执行：需要专用的 `DSH_POCKET_TEST_HOSTNAME/TOKEN/PORT` 并显式打开公网，跟本轮审计的本地回归无关；改动涉及的 LAN/公网来源分级由 `test/proxy.test.js` 与 `test/webserver-mount.test.js` 的端到端用例覆盖。
-- 关键回归用例：`?token=` 三处脱敏（含同名参数只摘 PIN、保留 dsh 启动 token、大写 `?TOKEN=`、`;` 后缀）、HTML 地址栏清理脚本、WS 认证 fail-closed、全局锁期间正确密码可登录、来源分级头不可伪造（含真实 HTTP 路由端到端）、status 的 accessToken/lanToken 按来源返回、公网来源 forbidden 矩阵（含 update/restart）、fileRead 边界 fail-closed 与 4MB 上限、删除路由信任栅栏、settings 跨进程合并/恢复出厂清派生文件与保留用户备份、恢复出厂删不掉派生文件时回滚并报失败、活锁下恢复出厂直接失败、主文件为数组时回退 `.bak`、PIN 写盘失败自愈与同 tick 内容比较、`profileFromPath` 的 npm/pnpm/desktop 布局、孤儿 cloudflared 不误杀活实例（含字符串 hostPid）、端口顺延拒绝开公网、compareVersions 预发布段 semver 顺序、隧道流量（cf 头与 X-Forwarded-For）强制公网、classifyHost 边界表、Homebrew digest 不回退 GitHub。
+- 关键回归用例：`?token=` 三处脱敏（含同名参数只摘 PIN、保留 dsh 启动 token、大写 `?TOKEN=`、`;` 后缀）、HTML 地址栏清理脚本、WS 认证 fail-closed、全局锁期间正确密码可登录、来源分级头不可伪造（含真实 HTTP 路由端到端）、status 的 accessToken/lanToken 按来源返回、公网来源 forbidden 矩阵（含 update/restart）、fileRead 边界 fail-closed 与 4MB 上限、删除路由信任栅栏、settings 跨进程合并/恢复出厂清派生文件与保留用户备份、恢复出厂删不掉派生文件时回滚并报失败、活锁下恢复出厂直接失败、主文件为数组时回退 `.bak`、PIN 写盘失败自愈与同 tick 内容比较、`profileFromPath` 的 npm/pnpm/desktop 布局、孤儿 cloudflared 不误杀活实例（含字符串 hostPid）、端口顺延拒绝开公网、compareVersions 预发布段 semver 顺序、隧道流量（cf 头与 X-Forwarded-For）强制公网、classifyHost 边界表、Homebrew digest 不回退 GitHub、未保护 Host 的 PIN 剥离、303 过渡页清理脚本、304 不改写、空 token 不计数、IPv4-mapped 分类。
 
 ## 复现脚本
 

@@ -110,7 +110,7 @@ npx @deepseek-ai/dsh web
 
 **升级兼容**：旧 Quick Tunnel 的开启/恢复标记不会恢复随机隧道；未配置时公网保持关闭。旧 Named Tunnel 的完整固定域名与 Token 配置可以继续使用；只有此前已开启、保留恢复标记且配置完整的命名隧道会在 DSH 重启后自动恢复。恢复出厂设置会关闭公网并清除域名、Token 和恢复标记，重新配置前不会开启。
 
-> 更新到新版本：重新执行上面的 `add` 命令即可（GitHub 地址不带 tag，装到的是默认分支最新提交）。想锁版本就写成 `github:daha1216/dsh-pocket#v3.0.6`，之后更新时把 tag 换成新版本号再 `add` 一次。
+> 更新到新版本：重新执行上面的 `add` 命令即可（GitHub 地址不带 tag，装到的是默认分支最新提交）。想锁版本就写成 `github:daha1216/dsh-pocket#v3.0.7`，之后更新时把 tag 换成新版本号再 `add` 一次。
 
 ### CLI 公网访问
 
@@ -220,7 +220,7 @@ Cloudflare 域名路由的 **Service 必须指向 CLI 的实际监听端口**（
 ```sh
 npm install
 node client/build.mjs   # 改 client/ 后重新打包
-npm test                # 代理 / 认证 / 压缩 / 隧道 / 服务 / RPC / 设置（300 测试）
+npm test                # 代理 / 认证 / 压缩 / 隧道 / 服务 / RPC / 设置（305 测试）
 ```
 
 **改完想在本机先试？** 不用发版：把插件换成指向本地仓库的软链，重启 dsh web 就是本地代码。完整步骤（含怎么换回 npm 官方版本）见 [LOCAL-DEV.md](./LOCAL-DEV.md)。

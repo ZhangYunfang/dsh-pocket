@@ -1,3 +1,20 @@
+## [3.0.7](https://github.com/daha1216/dsh-pocket/compare/v3.0.6...v3.0.7) (2026-10-27)
+
+> 第五轮对抗验证（proxy 安全回归，48b5ea9 → 9af15ca）后的补丁，完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。
+
+### Security
+
+* **proxy:** 已配置密码但当前 Host 不受保护（本机入口 / 关掉局域网密码）时，分享链接里的 `?token=<PIN>` 现在也会在转发前剥离——旧实现只在受保护 Host 上构造剥离列表，明文密码会进上游访问日志与地址栏；HTTP 与 WS 两条通道都补了 `__pocketTokenScrubbed` 标记
+* **proxy:** issue #91 的 303 握手过渡页也注入地址栏清理脚本，PIN 不再留在浏览器历史；同时删除上游 303 的 `content-encoding`，避免明文过渡页被按 gzip 解码成白屏
+* **proxy:** HTML 注入跳过 204/304（无正文响应），不再写出与实际不符的 `content-length`、不再清掉 304 的 `etag`/`last-modified` 缓存验证器
+* **proxy:** `?token` / `?token=` 空值不再计为一次密码尝试——扫描器或截断的分享链接不能把共享出口 IP 锁 60 秒
+
+### Bug Fixes
+
+* **proxy:** `::ffff:127.0.0.1` 这类 IPv4-mapped IPv6 字面量按嵌入的 IPv4 分类，protected 模式下本机访问不再被要求公网 PIN
+* **proxy:** WS 上游握手补 `x-dsh-pocket-origin`，与 HTTP 侧来源分级保持一致
+* **test:** 新增未保护 Host 的 PIN 剥离、303 过渡页清理脚本、304 不改写、空 token 不计数、IPv4-mapped 分类 5 条回归
+
 ## [3.0.6](https://github.com/daha1216/dsh-pocket/compare/v3.0.5...v3.0.6) (2026-10-27)
 
 > 第四轮对抗验证（settings 生命周期 / PIN 缓存 / pnpm 安装布局）后的补丁，完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。
