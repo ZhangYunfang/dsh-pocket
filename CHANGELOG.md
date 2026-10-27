@@ -1,3 +1,26 @@
+## [3.0.8](https://github.com/daha1216/dsh-pocket/compare/v3.0.7...v3.0.8) (2026-10-27)
+
+> 第六轮对抗验证（CLI/更新链路、并发与内存生命周期）后的补丁，完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。
+
+### Security
+
+* **update:** Windows 上 `spawn('dsh', …)`/`taskkill` 固定 `cwd: homedir()`——两者都会先搜当前目录，宿主工作区里放同名的 `dsh.cmd`/`tasklist.exe` 就能在“检查更新”“启停隧道”时以宿主权限执行（横穿 DSH 沙箱边界）；`tasklist`/`taskkill` 同样处理
+* **restart:** 自重启日志改为 `mkdtemp` 私有目录（0700）+ 文件 0600：旧实现把可预测名字的 0644 日志放共享 tmpdir，同机用户可预建符号链接读走 dsh web 的启动 token
+* **restart:** 辅助进程异步 `error` 或拿不到 pid 时不再安排 500ms 自杀——旧实现会把旧宿主杀掉而不拉起新进程，服务直接停摆
+* **cli:** `--no-auth` 不再静默压过 `--pin`/`DSH_POCKET_PIN`（现在直接拒绝启动），并在非 `--public` 时提示用户自建隧道/端口转发同样会暴露无密码入口
+* **cli:** `--host`/`--port`/`--launch-token` 缺值不再吞掉下一个 flag；`--port` 校验 1-65535；`--host` 私网 IP 直接用于局域网二维码（此前打印未监听的网卡地址）
+* **cli:** 新增 `--launch-token`，新版 dsh 首屏 `/api` 401 时可显式传入（CLI 拿不到 `dsh web` 打印的启动 token，插件模式会自动注入）
+* **ip:** `isValidIpv4` 拒绝 `0.0.0.0`/广播/组播/前导零地址，避免把不可展示的地址写进二维码
+
+### Bug Fixes
+
+* **proxy:** WS 并发增加每 IP 上限（32）与全站 `maxConnections=256`、`headersTimeout`/`requestTimeout`——无上限时单个出口 IP 开几百条长连接即可耗尽 fd/内存
+* **proxy:** session/list 瘦身上限 64MB→16MB，并限制同时瘦身的并发数（3）——无全局预算时 32 条 64MB 响应约 2GB RSS，OOM 的是 dsh web 宿主
+* **proxy:** 手工清缓存导出 `clearProxyCaches()`；代理关闭时清空 immutable/session-list 缓存（此前 34MB 缓存常驻到进程退出）；handshake 重试计数按 4096 上限淘汰
+* **proxy:** WS 升级成功后释放 `proxyReq._header`（内含 cookie）并摘掉“升级前断开”监听，不再按连接数累积
+* **ci:** 测试前重建 `client/client.js` 并 `git diff --exit-code`，源码改了产物没重建会直接红
+* **pkg:** `files` 补 `NOTICE.md`
+
 ## [3.0.7](https://github.com/daha1216/dsh-pocket/compare/v3.0.6...v3.0.7) (2026-10-27)
 
 > 第五轮对抗验证（proxy 安全回归，48b5ea9 → 9af15ca）后的补丁，完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。

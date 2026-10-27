@@ -7,9 +7,9 @@ import { createPocketService, selectLanIPv4 } from '../lib/service.mjs';
 import { installPocketRpc } from '../lib/web-rpc.js';
 import { POCKET_RPC_CHANNEL, POCKET_ENDPOINTS } from '../client/api.js';
 import { isValidIpv4 } from '../lib/ip.mjs';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 function fakeCtxConnection() {
   let handler = null;
@@ -621,8 +621,13 @@ test('自重启：restartHost 用 detached 辅助进程交接，旧进程随后�
     },
   });
   assert.equal(result.helperPid, 4242, '返回辅助进程 pid');
-  assert.ok(result.logOut.endsWith('.out.log'), '输出日志路径');
-  assert.ok(result.logErr.endsWith('.err.log'), '错误日志路径');
+  // 日志放在每次重启新建的私有目录里（防共享 tmpdir 的预测名/符号链接抢注）
+  assert.equal(basename(result.logOut), 'out.log', '输出日志文件名');
+  assert.equal(basename(result.logErr), 'err.log', '错误日志文件名');
+  assert.equal(dirname(result.logOut), dirname(result.logErr), '两个日志同目录');
+  if (process.platform !== 'win32') {
+    assert.equal(statSync(dirname(result.logOut)).mode & 0o777, 0o700, '日志目录仅本人可进');
+  }
   // 辅助进程：node -e <helperCode>，detached，代码内含新 dsh 的启动命令
   assert.equal(calls.length, 1, '只拉起一个辅助进程');
   const helper = calls[0];
@@ -663,6 +668,32 @@ test('自重启失败：spawn 抛错 → 返回 helperPid:null 和错误', async
   });
   assert.equal(result.helperPid, null);
   assert.match(result.error, /boom/);
+});
+
+test('自重启失败：辅助进程异步 spawn 失败/没有 pid 时绝不杀宿主', async () => {
+  const { restartHost } = await import('../lib/restart.js');
+  const { EventEmitter } = await import('node:events');
+  const killed = [];
+
+  // 情形 1：spawn 返回对象但 pid 为空（例如被 EDR 拦截后只给了一个空壳）
+  const noPid = restartHost({
+    internals: { spawn: () => ({ pid: undefined, unref() {}, once() {} }), kill: (pid) => killed.push(pid) },
+  });
+  assert.equal(noPid.helperPid, null);
+  assert.match(noPid.error, /did not spawn/);
+
+  // 情形 2：异步 'error' 事件（EMFILE 等只能在事件循环里报告）→ 必须取消 500ms 自杀
+  const helper = new EventEmitter();
+  helper.pid = 4243;
+  helper.unref = () => {};
+  const asyncFail = restartHost({
+    internals: { spawn: () => helper, kill: (pid) => killed.push(pid) },
+  });
+  assert.equal(asyncFail.helperPid, 4243);
+  helper.emit('error', new Error('EMFILE'));
+
+  await new Promise((r) => setTimeout(r, 700));
+  assert.deepEqual(killed, [], '两种失败都不应结束当前宿主（否则旧进程没了、新进程也没起来）');
 });
 
 test('readRestartNotice：真实文件系统（无文件/坏 JSON/过期/有效）', async () => {

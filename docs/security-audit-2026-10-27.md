@@ -23,7 +23,8 @@
 ### 内存 / 解压炸弹
 
 - **`POST /api/session/list` 请求体无上限**（单请求可涨 ~150MB）：`content-length` 预检 + 边收边计数，超 1MB 直接改成流式转发，不在代理里攒整包。
-- **session/list 响应全量缓冲/解压/重压**：`content-length` 预检 + 64MB 上限，超限流式透传；解压一律带 `maxOutputLength`。
+- **session/list 响应全量缓冲/解压/重压**：`content-length` 预检 + 16MB 上限、最多 3 条并发瘦身（无全局预算时 32 条 64MB 响应约 2GB RSS），超限流式透传；解压一律带 `maxOutputLength`。
+- **WS/连接无上限**：全站 `maxConnections=256` + 每 IP WS 并发 32 + `headersTimeout`/`requestTimeout`；WS 升级成功后释放请求头缓冲（含 cookie）；代理关闭时清空缓存；handshake 计数上限 4096。
 - **HTML 注入分支可被解压炸弹打爆**：4MB 预检、边收边计数超限即 `pipe` 直通、`gunzip/brotli/inflate` 全部 `maxOutputLength`。
 
 ### 路径 / 文件
@@ -86,6 +87,16 @@
 - **空 `?token` 不计数**（low）：`?token` / `?token=` 空值不再计为一次密码尝试，扫描器/截断链接不能把共享出口 IP 锁 60 秒。
 - **IPv4-mapped IPv6**（信息）：`::ffff:127.0.0.1` 按嵌入的 IPv4 分类，protected 模式下本机访问不再要公网 PIN；WS 上游补 `x-dsh-pocket-origin` 与 HTTP 对齐。
 
+### 第六轮追加（同日，CLI/更新链路与并发内存）
+
+- **Windows 当前目录执行劫持**：`spawn('dsh', …)`、`spawn('taskkill', …)`、`execFile('tasklist'/'taskkill')` 固定 `cwd: homedir()`——这些 API 都会先搜当前目录，宿主工作区里放同名 `.cmd`/`.exe` 就能以宿主权限执行（横穿 DSH 沙箱边界）。
+- **自重启日志可预测 + 0644 + 跟随符号链接**：改为每次重启 `mkdtemp` 0700 私有目录、日志文件 0600；清理逻辑同时兼容旧版裸 `.log`。
+- **自重启异步失败仍杀宿主**：辅助进程异步 `error` 或拿不到 pid 时取消 500ms 自杀并返回错误，不再出现“旧进程没了、新进程也没起来”。
+- **CLI 取值/校验**：`--host`/`--port`/`--launch-token` 缺值不再吞下一个 flag；`--port` 校验 1-65535；`--no-auth` 与已提供密码冲突时拒绝启动；`--host` 为私网 IP 时二维码用它；`isValidIpv4` 拒绝 `0.0.0.0`/广播/组播/前导零。
+- **CLI 缺 dsh launch token**：新增 `--launch-token`（显式传入）；不传时仅影响新版 dsh 的首屏 `/api`（401，fail-closed），插件模式仍自动注入。
+- **CI 不校验构建产物**：测试前 `npm run build:client` + `git diff --exit-code -- client/client.js`。
+- **内存/连接上限**：见上节「内存/解压炸弹」最后一条。
+
 ## 明确不修（附理由）
 
 - **`isLoopback` 被硬编码为 true**：真正机制是代理注入的 transport shim 把 `ownsHost` 置 true；该字段只是旧宿主兜底、项目文档自认是 UI 开关，PIN 持有者等同本机操作者是设计承诺（README 安全章节已写明）。
@@ -103,9 +114,9 @@
 
 ## 验证
 
-- `node --test --test-timeout=30000 "test/*.test.js"`：**305 tests / 303 pass / 0 fail / 2 skipped**（2 个 skip 为跨平台占位用例）。
+- `node --test --test-timeout=30000 "test/*.test.js"`：**309 tests / 307 pass / 0 fail / 2 skipped**（2 个 skip 为跨平台占位用例）。
 - `npm run test:local`（真机 + 真实 Cloudflare 隧道）未执行：需要专用的 `DSH_POCKET_TEST_HOSTNAME/TOKEN/PORT` 并显式打开公网，跟本轮审计的本地回归无关；改动涉及的 LAN/公网来源分级由 `test/proxy.test.js` 与 `test/webserver-mount.test.js` 的端到端用例覆盖。
-- 关键回归用例：`?token=` 三处脱敏（含同名参数只摘 PIN、保留 dsh 启动 token、大写 `?TOKEN=`、`;` 后缀）、HTML 地址栏清理脚本、WS 认证 fail-closed、全局锁期间正确密码可登录、来源分级头不可伪造（含真实 HTTP 路由端到端）、status 的 accessToken/lanToken 按来源返回、公网来源 forbidden 矩阵（含 update/restart）、fileRead 边界 fail-closed 与 4MB 上限、删除路由信任栅栏、settings 跨进程合并/恢复出厂清派生文件与保留用户备份、恢复出厂删不掉派生文件时回滚并报失败、活锁下恢复出厂直接失败、主文件为数组时回退 `.bak`、PIN 写盘失败自愈与同 tick 内容比较、`profileFromPath` 的 npm/pnpm/desktop 布局、孤儿 cloudflared 不误杀活实例（含字符串 hostPid）、端口顺延拒绝开公网、compareVersions 预发布段 semver 顺序、隧道流量（cf 头与 X-Forwarded-For）强制公网、classifyHost 边界表、Homebrew digest 不回退 GitHub、未保护 Host 的 PIN 剥离、303 过渡页清理脚本、304 不改写、空 token 不计数、IPv4-mapped 分类。
+- 关键回归用例：`?token=` 三处脱敏（含同名参数只摘 PIN、保留 dsh 启动 token、大写 `?TOKEN=`、`;` 后缀）、HTML 地址栏清理脚本、WS 认证 fail-closed、全局锁期间正确密码可登录、来源分级头不可伪造（含真实 HTTP 路由端到端）、status 的 accessToken/lanToken 按来源返回、公网来源 forbidden 矩阵（含 update/restart）、fileRead 边界 fail-closed 与 4MB 上限、删除路由信任栅栏、settings 跨进程合并/恢复出厂清派生文件与保留用户备份、恢复出厂删不掉派生文件时回滚并报失败、活锁下恢复出厂直接失败、主文件为数组时回退 `.bak`、PIN 写盘失败自愈与同 tick 内容比较、`profileFromPath` 的 npm/pnpm/desktop 布局、孤儿 cloudflared 不误杀活实例（含字符串 hostPid）、端口顺延拒绝开公网、compareVersions 预发布段 semver 顺序、隧道流量（cf 头与 X-Forwarded-For）强制公网、classifyHost 边界表、Homebrew digest 不回退 GitHub、未保护 Host 的 PIN 剥离、303 过渡页清理脚本、304 不改写、空 token 不计数、IPv4-mapped 分类、CLI 取值 flag 不吞参数与端口校验、`--no-auth` 与 PIN 冲突、isValidIpv4 严格性、自重启异步失败不杀宿主、日志目录 0700。
 
 ## 复现脚本
 

@@ -176,3 +176,32 @@ test('issue #90：为可测性加的 isDirectRun 守卫不能把 CLI 变成哑�
   // 而 import 本文件（测试就是这么做的）不能顺带把服务跑起来 —— 上面几条测试
   // 能跑到这里本身就是证据：如果 import 触发了 main()，进程会挂在 await 上不退出。
 });
+
+test('CLI 参数：取值型 flag 不吞下一个 flag、端口范围校验、launch-token 透传', async () => {
+  // `--host --public` 曾把字面量 "--public" 当主机名（ENOTFOUND），且静默吞掉 --public
+  const hostMissing = parseArgs(['--host', '--public']);
+  assert.match(hostMissing.argError, /--host/);
+  // `--port 0` / 非数字曾静默回落 3081，用户以为换了端口
+  assert.match(parseArgs(['--port', '0']).argError, /--port/);
+  assert.match(parseArgs(['--port', 'abc']).argError, /--port/);
+  assert.equal(parseArgs(['--port', '3099']).port, 3099);
+  assert.equal(parseArgs(['--launch-token', 'tok-123']).launchToken, 'tok-123');
+  assert.match(parseArgs(['--launch-token', '--public']).argError, /--launch-token/);
+});
+
+test('CLI 参数：--no-auth 不能静默压过已提供的密码', async () => {
+  // 旧行为：--no-auth 直接返回 pin:null，用户以为设了 --pin，实际入口是裸的
+  assert.match(cliArgError({ noAuth: true, pin: 'hunter2!' }), /冲突|conflict/);
+  assert.match(cliArgError({ noAuth: true }, { DSH_POCKET_PIN: 'hunter2!' }), /冲突|conflict/);
+  assert.equal(cliArgError({ noAuth: true }, {}), null);
+});
+
+test('isValidIpv4：0.0.0.0/广播/组播/前导零都不可作为展示地址', async () => {
+  const { isValidIpv4 } = await import('../lib/ip.mjs');
+  for (const bad of ['0.0.0.0', '255.255.255.255', '224.0.0.1', '010.0.0.1', '1.2.3.256', '1.2.3', '::1']) {
+    assert.equal(isValidIpv4(bad), false, bad);
+  }
+  for (const good of ['192.168.1.20', '10.0.0.2', '100.119.24.44', '8.8.8.8']) {
+    assert.equal(isValidIpv4(good), true, good);
+  }
+});

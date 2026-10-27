@@ -19,7 +19,8 @@
     "client",
     "cordis.patch.yml",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE.md"
   ],
   "scripts": {
     "build:client": "node client/build.mjs",
@@ -82,7 +83,7 @@
     "access": "public",
     "registry": "https://registry.npmjs.org/"
   },
-  "version": "3.0.7",
+  "version": "3.0.8",
   "allowScripts": {
     "esbuild@0.25.12": true
   }

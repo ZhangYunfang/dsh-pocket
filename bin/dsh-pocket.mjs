@@ -18,6 +18,7 @@ import { createPocketProxy, classifyHost } from '../lib/proxy.mjs';
 import { startNamedTunnel } from '../lib/tunnel.mjs';
 import { tunnelHostname, tunnelToken } from '../lib/settings.mjs';
 import { selectLanIPv4 } from '../lib/service.mjs';
+import { isValidIpv4 } from '../lib/ip.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -28,10 +29,16 @@ export const MIN_PIN_LENGTH = 8;
  * `--public` + `--no-auth` 是能把「公网域名」直接变成无鉴权入口的组合：
  * resolvePin 先返回 pin=null，buildAuth(null) 返回 null，代理里 `if (auth)` 整块跳过，
  * 于是任何知道固定域名的人都能操作 dsh web（= 在宿主机执行代码）。必须阻止启动。 */
-export function cliArgError(args = {}) {
+export function cliArgError(args = {}, env = {}) {
   if (args.public && args.noAuth) {
     return '--public 不能与 --no-auth 同时使用：那会让你的固定域名变成无密码的公网入口。'
       + ' | --public cannot be combined with --no-auth.';
+  }
+  // --no-auth 曾静默压过 --pin / DSH_POCKET_PIN：用户以为设了密码，实际入口是裸的。
+  const envPin = env.DSH_POCKET_PIN != null ? String(env.DSH_POCKET_PIN) : '';
+  if (args.noAuth && ((args.pin != null && String(args.pin) !== '') || envPin !== '')) {
+    return '--no-auth 与已提供的访问密码冲突：要么去掉 --no-auth，要么删掉 --pin / DSH_POCKET_PIN。'
+      + ' | --no-auth conflicts with a configured PIN.';
   }
   return null;
 }
@@ -45,12 +52,46 @@ export function parseArgs(argv) {
     pin: null,
     pinMissing: false,
     noAuth: false,
+    launchToken: '',
+    argError: null,
+  };
+  // 取值型参数统一走这里：缺值或以 '-' 开头都报错，不能把下一个 flag 吞成值。
+  // `--host --public` 曾把字面量 "--public" 当主机名（ENOTFOUND），
+  // `--port 0` / 非数字曾静默回落 3081（用户以为换了端口）。
+  const takeValue = (name, i) => {
+    const next = argv[i + 1];
+    if (next === undefined || next.startsWith('-')) {
+      args.argError = `${name} 后面需要一个值 | ${name} requires a value`;
+      return null;
+    }
+    return next;
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--public') args.public = true;
-    else if (a === '--port') args.port = Number(argv[++i]) || 3081;
-    else if (a === '--host') args.host = argv[++i] ?? '0.0.0.0';
+    else if (a === '--port') {
+      const raw = takeValue('--port', i);
+      if (raw === null) break;
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 1 || n > 65535) {
+        args.argError = `--port 需要 1-65535 之间的整数（收到 ${JSON.stringify(raw)}）| --port expects an integer between 1 and 65535`;
+        break;
+      }
+      args.port = n;
+      i++;
+    }
+    else if (a === '--host') {
+      const raw = takeValue('--host', i);
+      if (raw === null) break;
+      args.host = String(raw);
+      i++;
+    }
+    else if (a === '--launch-token') {
+      const raw = takeValue('--launch-token', i);
+      if (raw === null) break;
+      args.launchToken = String(raw);
+      i++;
+    }
     else if (a === '--pin') {
       // 缺值时要报错，不能把下一个 flag 当成密码：`--pin --public` 曾让
       // 字面量 "--public" 通过长度校验，同时把 --public 吞掉（用户以为开了公网）。
@@ -154,8 +195,9 @@ function printHelp() {
 用法：
   dsh-pocket             局域网模式（手机同一 WiFi）
   dsh-pocket --public    公网模式（使用已配置的固定域名与 Tunnel Token）
-  dsh-pocket --port 3081 自定义代理端口
-  dsh-pocket --host      自定义监听地址（默认 0.0.0.0）
+  dsh-pocket --port 3081 自定义代理端口（1-65535）
+  dsh-pocket --host <地址> 自定义监听地址（默认 0.0.0.0；只填一个私网 IP 时二维码用它）
+  dsh-pocket --launch-token <值> dsh web 的启动 token（新版 dsh 首屏 401 时用；插件模式会自动注入）
   dsh-pocket --pin <值>  自定义访问密码（至少 ${MIN_PIN_LENGTH} 位；也可用环境变量 DSH_POCKET_PIN）
   dsh-pocket --no-auth   关闭访问密码（不推荐，见下）
   dsh-pocket --help      帮助
@@ -187,7 +229,7 @@ function printQr(url, label) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  const argError = cliArgError(args);
+  const argError = args.argError ?? cliArgError(args, process.env);
   if (argError) {
     console.error(`❌ ${argError}`);
     process.exit(1);
@@ -203,7 +245,10 @@ async function main() {
   const publicConfig = args.public ? resolvePublicConfig() : null;
 
   console.log('🚀 dsh-pocket 启动中…');
-  const { port, close } = await createPocketProxy({ ...args, auth });
+  // launchToken：CLI 拿不到 `dsh web` 打印的启动 token，只能由用户显式传入；
+  // 不传时新版 dsh 首屏 /api 会 401（与插件模式的差异，见 --launch-token）。
+  const launchToken = args.launchToken ? () => args.launchToken : undefined;
+  const { port, close } = await createPocketProxy({ ...args, auth, launchToken });
 
   if (pin) {
     console.log(`\n🔐 访问密码：${pin}${resolved.source === 'generated' ? '（本次随机生成）' : ''}`);
@@ -215,11 +260,20 @@ async function main() {
     console.log('\n⚠️  已用 --no-auth 关闭访问密码。');
     console.log('   dsh web 能在这台机器上执行任意代码——现在任何能连到');
     console.log(`   ${args.host}:${args.port} 的人都可以直接控制它。请仅在完全可信的网络里这样用。`);
+    if (!args.public) {
+      // 用户自建的隧道/反代不经过本 CLI，--public 检查拦不到，只能明确提醒（审计 low）
+      console.log('   注意：如果你另开了 Cloudflare 隧道、ngrok、frp 或路由器端口转发，');
+      console.log('   它们也会把这个无密码端口暴露出去——请先确认没有任何公网入口。');
+    }
   }
 
-  const lan = lanIPv4();
+  // 指定了具体监听地址就别再打印一个没在监听的网卡 IP（审计 low：实测二维码指向未监听地址）
+  const explicitHost = args.host && args.host !== '0.0.0.0' && args.host !== '::' && args.host !== '::0';
+  const lan = explicitHost ? (isValidIpv4(args.host) ? args.host : null) : lanIPv4();
   if (lan) {
     printQr(entryUrl(`http://${lan}:${port}`, pin), '📶 局域网访问（手机连同一 WiFi）：');
+  } else if (explicitHost) {
+    console.log(`⚠️  --host ${args.host} 不是可打印二维码的 IPv4 地址，跳过局域网二维码`);
   } else {
     console.log('⚠️  未检测到局域网 IP，跳过局域网二维码');
   }
