@@ -650,7 +650,7 @@ export function mobileApply(ctx: ClientContext): void {
       if (dialog === active) return
       if (active !== null && dialog !== null) {
         // 弹层被**替换**（菜单 → 删除确认 / 错误卡）：这不是关闭，不能把焦点
-        // 还给背后的触发按钮，也不能 pop triggerStack——直接把陷阱移到新弹层。
+        // 还给背后的触发按钮——直接把陷阱移到新弹层。
         // 旧实现走 close 分支后 active=null 且 return，新弹层要等下一次 DOM
         // 突变才会重新拿到焦点；上游用 innerHTML 重建卡片时可能很久没有下一次
         // 突变，期间 Tab 可以穿回背景列表，"模态"短暂失效（审计 F1）。
