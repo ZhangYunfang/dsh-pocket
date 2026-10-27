@@ -893,6 +893,8 @@ test('compareVersions：语义化版本比较', async () => {
   assert.ok(compareVersions('1.0.4-rc.10', '1.0.4-rc.9') > 0, '预发布数字段按数值（rc.10 > rc.9）');
   assert.ok(compareVersions('1.0.4-rc.9', '1.0.4-rc.10') < 0, '反过来');
   assert.ok(compareVersions('1.0.4-alpha.1', '1.0.4-alpha.10') < 0, 'alpha.1 < alpha.10（数值比较）');
+  assert.ok(compareVersions('1.0.4-1', '1.0.4-alpha') < 0, '数字标识符低于字母（semver 规则）');
+  assert.ok(compareVersions('1.0.4-alpha', '1.0.4-1') > 0, '反过来');
 });
 
 test('stop 竞态：stop 打断 in-flight 后立即 start，不会并发 spawn cloudflared', async () => {

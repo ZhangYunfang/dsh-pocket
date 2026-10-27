@@ -61,9 +61,9 @@ function fakeService({ dshPort = 3080 } = {}) {
 }
 
 /** 拿一个本地 HTTP 请求结果。 */
-function postJson(port, path, body, { host = '127.0.0.1', origin, contentType = 'application/json', secFetchSite } = {}) {
+function postJson(port, path, body, { host = '127.0.0.1', origin, contentType = 'application/json', secFetchSite, headers: extra = {} } = {}) {
   return new Promise((resolve, reject) => {
-    const headers = { host, 'content-type': contentType };
+    const headers = { host, 'content-type': contentType, ...extra };
     if (origin !== undefined) headers.origin = origin;
     if (secFetchSite !== undefined) headers['sec-fetch-site'] = secFetchSite;
     const payload = body === undefined ? '' : JSON.stringify(body);
@@ -118,6 +118,39 @@ test('认证门：requestRejection 返回 401 → 401 unauthorized', async () =>
     const res = await postJson(env.port, `${POCKET_RPC_CHANNEL}/${POCKET_ENDPOINTS.status}`, { rpcId: 'r2', method: POCKET_ENDPOINTS.status, payload: {} });
     assert.equal(res.status, 401);
     assert.equal(res.body, 'unauthorized');
+  } finally { await env.stop(); }
+});
+
+test('来源分级：HTTP 路由把 x-dsh-pocket-origin 透传给 status，公网/局域网看不到敏感 PIN', async () => {
+  // 这条走的是真实 HTTP mount 路径（代理把不可伪造的来源写进该头），
+  // 而不是直接调 handler 的第 4 个参数，防止「测试过了、线上没接上」。
+  const opts = { getToken: () => 'PUBPIN01', getLanToken: () => 'LANPIN02' };
+  const env = await setup({ opts, requestRejection: () => undefined });
+  const call = (tag, headers) => postJson(
+    env.port,
+    `${POCKET_RPC_CHANNEL}/${POCKET_ENDPOINTS.status}`,
+    { rpcId: tag, method: POCKET_ENDPOINTS.status, payload: {} },
+    { headers },
+  );
+  try {
+    const pub = JSON.parse((await call('o1', { 'x-dsh-pocket-origin': 'public' })).body).result.value;
+    assert.equal(pub.origin, 'public');
+    assert.equal(pub.accessToken, null, '公网来源不得拿到公网 PIN');
+    assert.equal(pub.lanToken, null, '公网来源不得拿到局域网 PIN');
+
+    const lan = JSON.parse((await call('o2', { 'x-dsh-pocket-origin': 'lan' })).body).result.value;
+    assert.equal(lan.origin, 'lan');
+    assert.equal(lan.accessToken, null, '局域网来源不得拿到公网 PIN');
+    assert.equal(lan.lanToken, 'LANPIN02', '局域网来源仍可管理局域网 PIN');
+
+    const local = JSON.parse((await call('o3', {})).body).result.value;
+    assert.equal(local.origin, 'loopback', '没有该头（本机直连）按 loopback');
+    assert.equal(local.accessToken, 'PUBPIN01');
+    assert.equal(local.lanToken, 'LANPIN02');
+
+    // 未知值一律按 loopback 处理（只有代理能写这个头，代理只会写三个合法值）
+    const bogus = JSON.parse((await call('o4', { 'x-dsh-pocket-origin': 'loopback, public' })).body).result.value;
+    assert.equal(bogus.origin, 'loopback');
   } finally { await env.stop(); }
 });
 

@@ -56,6 +56,12 @@
 - **公网访客改自己的公网 PIN**：它本来就有 DSH 全权（可执行代码读 PIN 文件），加门禁属安全剧场；局域网 PIN 的跨通道操作已封。
 - **Windows `mode:0o600` 是空操作**：Node 在 Windows 不支持 POSIX 权限位，实际取决于 `$DSH_HOME` 的 NTFS ACL；已在 README 说明。
 - **移动端上游 vendored 代码的 4 条 low/medium**（`style` scope 每帧唤醒、swipe disposer 结算、drawer Escape 全局判定、focus shadow 单例）：均来自 dsh-web-mobile 的上游实现，改动会在下次同步时冲突；本轮只修了 pocket 自己写的两处（F1/F3），其余记入待上游同步。
+- **命名隧道把 HTTP Host Header 配成 `127.0.0.1:3081` 时公网会被判成本机**：cloudflared 与本地反代都以 loopback 连入，代理拿不到原始 Host，无法可靠区分。保持 Cloudflare 路由的默认（转发域名）即安全；已在 README 安全章节写明这是配置约束，不建议在代理侧猜测来源。
+
+## 已知限制
+
+- 来源分级依赖代理写入的 `x-dsh-pocket-origin`，而该头只在 dsh 提供 `webServer`（0.1.5+）走 HTTP 挂载时才能带到宿主。更老的 dsh 会回退到 `connection.rpc.handle` 通道，此时 handler 拿不到请求上下文，一律按 loopback 处理——这类宿主上「公网访客看不到局域网/公网 PIN」的加固不生效（但公网入口的 PIN 校验本身仍由代理负责）。
+- 上游中断（origin 半路断开）时，代理会选择销毁客户端连接而不是转发半截正文：这是有意的（避免把不完整内容当成正常响应），代价是浏览器看到 `socket hang up`；移动端会重试。
 
 ## 验证
 

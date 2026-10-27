@@ -1623,10 +1623,19 @@ test('隐私：?token=<PIN> 命中后明文 PIN 不再进上游请求行 / Refer
     });
     assert.equal(r3.status, 200, '子资源 200');
 
+    // 4) 同名参数并存：`token=<PIN>` 与 dsh 自己的启动 token 同名，只摘 PIN，
+    //    不能把启动 token 一起删掉（否则上游握手被打破），也不能漏摘排在后面的 PIN
+    const r4 = await get(`/?token=${PIN}&token=DSHLAUNCH&keep=1`, { Cookie: `dsh_pocket_token=${hashed}` });
+    assert.equal(r4.status, 200, '同名参数请求 200');
+
     for (const hit of seen) {
       assert.ok(!String(hit.url).includes(PIN), `上游请求行不得出现明文 PIN（实得：${hit.url}）`);
     }
     assert.ok(seen.some((h) => h.url === '/?keep=1'), '非 token 的 query 参数必须保留');
+    const launchKept = seen.find((h) => String(h.url).includes('token=DSHLAUNCH'));
+    assert.ok(launchKept, '与 PIN 同名的 dsh 启动 token 必须保留');
+    assert.ok(!String(launchKept.url).includes(PIN), '保留启动 token 时 PIN 仍要摘掉');
+    assert.match(String(launchKept.url), /keep=1/, '其余参数一并保留');
     const asset = seen.find((h) => String(h.url).startsWith('/assets/a.js'));
     assert.ok(asset, '子资源请求到达上游');
     assert.ok(!String(asset.referer ?? '').includes(PIN), `Referer 不得带明文 PIN（实得：${asset.referer}）`);

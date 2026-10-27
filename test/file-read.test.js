@@ -127,6 +127,18 @@ test('fileRead 缺少路径 / 文件不存在 / 目录 均报错', async () => {
   assert.equal(empty.ok, false, '缺 path 应报错');
 });
 
+test('fileRead 超过 4MB 的文件直接拒绝（不在主机上整包读进内存）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pocket-fr-'));
+  const file = join(dir, 'big.txt');
+  writeFileSync(file, 'x'.repeat(4 * 1024 * 1024 + 1));
+  const { ctx, call } = makeCtx();
+  installPocketRpc(ctx, { service: { status: async () => ({}) } });
+  const res = await call(POCKET_ENDPOINTS.fileRead, { path: file });
+  assert.equal(res.ok, false, '超过上限应报错');
+  assert.match(res.error?.message ?? '', /过大|too large/i);
+  unlinkSync(file);
+});
+
 test('fileRead 二进制文件报错（不复制无意义文本）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'pocket-fr-'));
   const file = join(dir, 'x.bin');
