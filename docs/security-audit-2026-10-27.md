@@ -65,8 +65,8 @@
 
 ## 验证
 
-- `node --test --test-timeout=30000 "test/*.test.js"`：**286 tests / 284 pass / 0 fail / 2 skipped**。
-- 关键回归用例：`?token=` 三处脱敏、HTML 地址栏清理脚本、WS 认证 fail-closed、全局锁期间正确密码可登录、来源分级头不可伪造、status 的 accessToken/lanToken 按来源返回、公网来源 forbidden 矩阵、fileRead 边界 fail-closed、删除路由信任栅栏、settings 跨进程合并与恢复出厂清派生文件、孤儿 cloudflared 不误杀活实例、端口顺延拒绝开公网。
+- `node --test --test-timeout=30000 "test/*.test.js"`：**288 tests / 286 pass / 0 fail / 2 skipped**（2 个 skip 为跨平台占位用例）。
+- 关键回归用例：`?token=` 三处脱敏（含同名参数只摘 PIN、保留 dsh 启动 token）、HTML 地址栏清理脚本、WS 认证 fail-closed、全局锁期间正确密码可登录、来源分级头不可伪造（含真实 HTTP 路由端到端）、status 的 accessToken/lanToken 按来源返回、公网来源 forbidden 矩阵、fileRead 边界 fail-closed 与 4MB 上限、删除路由信任栅栏、settings 跨进程合并与恢复出厂清派生文件、孤儿 cloudflared 不误杀活实例、端口顺延拒绝开公网、compareVersions 预发布段 semver 顺序。
 
 ## 复现脚本
 
