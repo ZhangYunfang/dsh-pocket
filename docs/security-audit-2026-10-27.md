@@ -49,6 +49,21 @@
 - 设置页：`withPending` 改引用计数（共用 `'prefs'` 时不再提前解锁）、所有 fetch 加超时、`waitForHostThenReload` 可中断（卸载/超时不再永久卡死或迟到 reload）、Esc 不冒泡一次关两层、PIN 输入框补 `autoComplete/name` 并对被过滤字符给出提示、错误文案走 locale。
 - 移动端：焦点陷阱遇到「弹层对象替换」不再当成关闭（否则新弹层要等下一次 DOM 突变才有焦点约束）；注入的「复制文件」按钮与链接用 id 绑定，React 重建行时清理失配旧按钮，避免长会话里越积越多。
 
+### 第二轮 / 第三轮追加（同日，三路对抗审查）
+
+第二轮派了三路只读子代理逐行对抗审查（认证/隐私、settings 生命周期、客户端/移动端），第三轮按报告修复：
+
+- **token 参数归一**：`?TOKEN=` 大写、`?token=<PIN>;foo=1` 这类值现在同样能认证、同样被剥离；地址栏清理脚本按键名小写匹配；同名参数逐个比对，只摘 PIN 不误删 dsh 启动 token。
+- **隧道流量强制公网**：源地址 loopback 且带 `cf-ray`/`cf-connecting-ip` 时，即使 Host 被 ingress/反代写成 `127.0.0.1` 也按公网要求密码（此前可被伪装成本机绕过）。
+- **来源分级头不可伪造**：代理先丢弃客户端自带的 `x-dsh-pocket-origin`，再按不可伪造来源重写；`classifyHost`/`isLoopbackHost` 共用 `hostNameOnly`，`127.evil.com`、尾点域名、IPv6 字面量不再被判成本机。
+- **公网来源禁止更新/重启**：`pocket.update` / `pocket.restart` 增加 `forbidden`；设置页更新横幅在公网来源下不渲染。
+- **回退 RPC 路径显式降级并告警**：宿主没有 `webServer.register` 时回退的 `rpc.handle` 通道拿不到请求上下文，只能按本机来源处理（与「PIN 持有者等同本机操作者」的既有承诺一致），日志会明确告警，便于确认加固为何未生效。
+- **全局锁节流**：全局锁期间错误猜测要消耗 `allowCompare` 预算（每 100ms 补 1、上限 10），分布式穷举不能再无限比对。
+- **settings 锁与恢复出厂**：stale 锁删不掉时不再无限忙等（会落到 deadline + sleep，实测不再 100% CPU 挂死）；恢复出厂只在持锁时删白名单派生文件，不误删 `settings.json.mybackup`、不动别人持有的 `.lock`；锁等待从 2s 降到 750ms，减少设置写入阻塞主线程。
+- **恢复出厂/`.bak` 回退**：主设置文件丢失或读坏时回退读 `.bak`（此前 `.bak` 是死代码，主文件丢一次就恢复出厂、隧道 Token 也一起丢）。
+- **供应链**：Homebrew bottle 拿不到 Homebrew digest 时不再回退 GitHub digest（两份构建哈希不同，回退会把正品误报「投毒」）；bottle 版本按数字段比较（`2025.10.0 > 2025.9.1`）。
+- **其它**：`hostPid` 字符串形式也能被孤儿清扫识别；PIN 文件被删后会重新生成（不再被缓存永久挡住）；`inferProfile` 正则锚定到插件安装路径；移动端焦点陷阱过滤隐藏弹层、取最上层、迁移时 pop 旧 opener；LAN PIN 读取失败与「公网不显示」分开提示；bridge 500 文案不再带内部错误。
+
 ## 明确不修（附理由）
 
 - **`isLoopback` 被硬编码为 true**：真正机制是代理注入的 transport shim 把 `ownsHost` 置 true；该字段只是旧宿主兜底、项目文档自认是 UI 开关，PIN 持有者等同本机操作者是设计承诺（README 安全章节已写明）。
@@ -56,17 +71,18 @@
 - **公网访客改自己的公网 PIN**：它本来就有 DSH 全权（可执行代码读 PIN 文件），加门禁属安全剧场；局域网 PIN 的跨通道操作已封。
 - **Windows `mode:0o600` 是空操作**：Node 在 Windows 不支持 POSIX 权限位，实际取决于 `$DSH_HOME` 的 NTFS ACL；已在 README 说明。
 - **移动端上游 vendored 代码的 4 条 low/medium**（`style` scope 每帧唤醒、swipe disposer 结算、drawer Escape 全局判定、focus shadow 单例）：均来自 dsh-web-mobile 的上游实现，改动会在下次同步时冲突；本轮只修了 pocket 自己写的两处（F1/F3），其余记入待上游同步。
-- **命名隧道把 HTTP Host Header 配成 `127.0.0.1:3081` 时公网会被判成本机**：cloudflared 与本地反代都以 loopback 连入，代理拿不到原始 Host，无法可靠区分。保持 Cloudflare 路由的默认（转发域名）即安全；已在 README 安全章节写明这是配置约束，不建议在代理侧猜测来源。
+- **命名隧道把 HTTP Host Header 配成 `127.0.0.1:3081` 时公网会被判成本机**：带 Cloudflare 边缘头（`cf-ray`/`cf-connecting-ip`）的隧道流量已强制按公网处理；但如果前面还套了一层本地反代、把 `Host` 改写成 loopback 同时又没保留任何转发头（例如 `ssh -R`/`socat`/`netsh portproxy` 直转），代理无法区分来源，此时请自行确保反代层要求认证，或让反代保留 `X-Forwarded-For`（本轮已把 `x-forwarded-for`/`x-real-ip`/`forwarded` 也纳入隧道识别）。nginx 默认的 `proxy_set_header Host $proxy_host` + `X-Real-IP` 组合已按公网处理。
 
 ## 已知限制
 
-- 来源分级依赖代理写入的 `x-dsh-pocket-origin`，而该头只在 dsh 提供 `webServer`（0.1.5+）走 HTTP 挂载时才能带到宿主。更老的 dsh 会回退到 `connection.rpc.handle` 通道，此时 handler 拿不到请求上下文，一律按 loopback 处理——这类宿主上「公网访客看不到局域网/公网 PIN」的加固不生效（但公网入口的 PIN 校验本身仍由代理负责）。
+- 来源分级依赖代理写入的 `x-dsh-pocket-origin`，而该头只在 dsh 提供 `webServer`（0.1.5+）走 HTTP 挂载时才能带到宿主。更老的 dsh 会回退到 `connection.rpc.handle` 通道，此时 handler 拿不到请求上下文，一律按 loopback 处理——这类宿主上「公网访客看不到局域网/公网 PIN」的加固不生效（但公网入口的 PIN 校验本身仍由代理负责）。回退时会打 warn 指明降级原因。能过公网 PIN 校验的人本来就可以让 DSH 执行本机代码，「设置页权限 = 本机」与 README 的既有承诺一致，因此不再用「无法区分的来源」去猜。
 - 上游中断（origin 半路断开）时，代理会选择销毁客户端连接而不是转发半截正文：这是有意的（避免把不完整内容当成正常响应），代价是浏览器看到 `socket hang up`；移动端会重试。
 
 ## 验证
 
-- `node --test --test-timeout=30000 "test/*.test.js"`：**288 tests / 286 pass / 0 fail / 2 skipped**（2 个 skip 为跨平台占位用例）。
-- 关键回归用例：`?token=` 三处脱敏（含同名参数只摘 PIN、保留 dsh 启动 token）、HTML 地址栏清理脚本、WS 认证 fail-closed、全局锁期间正确密码可登录、来源分级头不可伪造（含真实 HTTP 路由端到端）、status 的 accessToken/lanToken 按来源返回、公网来源 forbidden 矩阵、fileRead 边界 fail-closed 与 4MB 上限、删除路由信任栅栏、settings 跨进程合并与恢复出厂清派生文件、孤儿 cloudflared 不误杀活实例、端口顺延拒绝开公网、compareVersions 预发布段 semver 顺序。
+- `node --test --test-timeout=30000 "test/*.test.js"`：**294 tests / 292 pass / 0 fail / 2 skipped**（2 个 skip 为跨平台占位用例）。
+- `npm run test:local`（真机 + 真实 Cloudflare 隧道）未执行：需要专用的 `DSH_POCKET_TEST_HOSTNAME/TOKEN/PORT` 并显式打开公网，跟本轮审计的本地回归无关；改动涉及的 LAN/公网来源分级由 `test/proxy.test.js` 与 `test/webserver-mount.test.js` 的端到端用例覆盖。
+- 关键回归用例：`?token=` 三处脱敏（含同名参数只摘 PIN、保留 dsh 启动 token、大写 `?TOKEN=`、`;` 后缀）、HTML 地址栏清理脚本、WS 认证 fail-closed、全局锁期间正确密码可登录、来源分级头不可伪造（含真实 HTTP 路由端到端）、status 的 accessToken/lanToken 按来源返回、公网来源 forbidden 矩阵（含 update/restart）、fileRead 边界 fail-closed 与 4MB 上限、删除路由信任栅栏、settings 跨进程合并/恢复出厂清派生文件与保留用户备份、孤儿 cloudflared 不误杀活实例（含字符串 hostPid）、端口顺延拒绝开公网、compareVersions 预发布段 semver 顺序、隧道流量（cf 头与 X-Forwarded-For）强制公网、classifyHost 边界表、Homebrew digest 不回退 GitHub。
 
 ## 复现脚本
 

@@ -407,17 +407,23 @@ test('恢复出厂：连 .tmp/.bak/.lock 派生文件一起清掉（.tmp 可能�
   setLanEnabled(false);
   const dest = settingsPath();
   const dir = join(home, 'dsh-pocket');
-  // 模拟崩溃/写失败残留：旧实现的固定 .tmp（可能含 tunnelToken）、备份、锁文件
+  // 模拟崩溃/写失败残留：旧实现的固定 .tmp（可能含 tunnelToken）、备份、过期锁文件
   writeFileSync(`${dest}.tmp`, '{"tunnelToken":"secret"}');
   writeFileSync(`${dest}.bak`, '{"lanEnabled":true}');
   writeFileSync(`${dest}.lock`, '');
+  // 锁必须是「过期」的：resetSettings 先拿锁，活锁属于另一个进程，不能删。
+  const old = new Date(Date.now() - 30_000);
+  utimesSync(`${dest}.lock`, old, old);
   writeFileSync(join(dir, 'unrelated.txt'), 'keep me');
+  // 用户自己起的同前缀文件不能被「前缀清扫」误删（审计 F3）。
+  writeFileSync(join(dir, 'settings.json.mybackup'), 'user file');
   assert.equal(resetSettings(), true);
   assert.equal(existsSync(dest), false, 'settings.json 已删除');
   for (const suffix of ['tmp', 'bak', 'lock']) {
     assert.equal(existsSync(`${dest}.${suffix}`), false, `.${suffix} 必须一起清掉`);
   }
   assert.equal(existsSync(join(dir, 'unrelated.txt')), true, '同目录其它文件不能误删');
+  assert.equal(existsSync(join(dir, 'settings.json.mybackup')), true, '用户自己的同前缀文件不能误删');
 }));
 
 test('PIN 缓存跟随磁盘：另一个实例刷新密码后本实例立即认新值（不再永远认旧值）', () => withHome(async (home) => {

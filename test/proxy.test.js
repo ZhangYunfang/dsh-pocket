@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import { gzipSync, brotliDecompressSync } from 'node:zlib';
 import { WebSocket, WebSocketServer } from 'ws';
 
-import { createPocketProxy, createHandshakeTracker, DEFAULT_INJECT, SW_SCRIPT, SW_SCRIPT_PATH, SW_REGISTER_SCRIPT, HASHED_ASSET_RE } from '../lib/proxy.mjs';
+import { createPocketProxy, createHandshakeTracker, classifyHost, DEFAULT_INJECT, SW_SCRIPT, SW_SCRIPT_PATH, SW_REGISTER_SCRIPT, HASHED_ASSET_RE } from '../lib/proxy.mjs';
 
 /** 构造一个带掩码的 WS 文本帧（浏览器在握手后立即发的首帧，会进 upgrade 的 head）。 */
 function maskedTextFrame(text) {
@@ -1931,6 +1931,123 @@ test('Range 请求：206 分片响应不得被代理压缩（否则浏览器解�
     const whole = await rawGet(proxy.port, '/big.txt', { 'accept-encoding': 'gzip' });
     assert.equal(whole.status, 200);
     assert.equal(whole.headers['content-encoding'], 'gzip', '200 仍照常压缩');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+// —— 第三轮对抗审查回归：大小写 / `;` 后缀 / Host 分类 / 隧道流量降级 ——
+
+test('隐私：大写 ?TOKEN= 与带 ; 后缀的 PIN 也必须在认证后被摘掉', async () => {
+  const PIN = 'pin12345';
+  const seen = [];
+  const up = createServer((req, res) => {
+    seen.push(req.url);
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('ok');
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    auth: { getToken: () => PIN, isProtected: () => true, sessionKey: 'sk' },
+  });
+  try {
+    // 大小写：`?TOKEN=` 与 `?token=` 等价（认证命中、且必须摘掉）
+    const upper = await rawGet(proxy.port, `/?TOKEN=${PIN}&keep=1`, { Accept: 'text/html' });
+    assert.equal(upper.status, 200, '大写参数同样能认证');
+    // 分号后缀：`token=<PIN>;x=1` 作为一个值也要认、也要摘
+    const semi = await rawGet(proxy.port, `/?token=${PIN};x=1`, { Accept: 'text/html' });
+    assert.equal(semi.status, 200, '带分号后缀同样能认证');
+
+    assert.deepEqual(seen, ['/?keep=1', '/'], `上游只能看到清理后的目标，实际: ${JSON.stringify(seen)}`);
+    for (const url of seen) assert.ok(!String(url).includes(PIN), '任何形式都不得把明文 PIN 转给上游');
+  } finally {
+    await proxy.close();
+    await new Promise((r) => up.close(r));
+  }
+});
+
+test('classifyHost：可注册域名/尾点/IPv6 字面量不再被判成本机（与 isLoopbackHost 对齐）', () => {
+  // 旧实现 `/^127\./` 直接匹配字符串：`127.evil.com` 是可注册域名，会被判 loopback
+  assert.equal(classifyHost('127.evil.com'), 'public', '127.evil.com 是可注册域名，必须 public');
+  assert.equal(classifyHost('127.0.0.1.'), 'loopback', '带尾点的 loopback 仍是 loopback');
+  assert.equal(classifyHost('localhost.'), 'loopback', '带尾点的 localhost 仍是 loopback');
+  assert.equal(classifyHost('[2001:db8::1]'), 'public', '公网 IPv6 字面量不是本机');
+  assert.equal(classifyHost('[fd00::1]:3081'), 'lan', 'ULA IPv6 是局域网');
+  assert.equal(classifyHost('::1'), 'loopback', 'IPv6 loopback');
+  assert.equal(classifyHost('100.64.0.9'), 'lan', 'CGNAT 仍是局域网');
+  assert.equal(classifyHost('0.0.0.0'), 'loopback', '通配地址按本机处理');
+  assert.equal(classifyHost('nas.local'), 'lan', 'mDNS 名仍是局域网');
+  assert.equal(classifyHost('example.com'), 'public');
+});
+
+test('隧道流量：loopback 源 + Cloudflare 边缘头时，Host 伪装成本机也必须走公网密码', async () => {
+  const PIN = 'PUBPIN12';
+  const seen = [];
+  const up = createServer((req, res) => {
+    seen.push(req.url);
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html><body>upstream</body></html>');
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const proxy = await createPocketProxy({
+    port: 0, host: '127.0.0.1',
+    upstream: { host: '127.0.0.1', port: up.address().port },
+    // 公网与局域网用不同 PIN：如果隧道流量被降级成 loopback/lan，会拿到 LAN PIN 而放行
+    auth: { getToken: (host) => (classifyHost(host) === 'public' ? PIN : 'LANPIN12'), isProtected: () => true, sessionKey: 'sk' },
+  });
+  const cfGet = (path) => new Promise((resolve, reject) => {
+    const req = httpRequest({
+      host: '127.0.0.1', port: proxy.port, path,
+      // cloudflared 的典型形态：TCP 源 loopback、Host 被 ingress 写成 127.0.0.1、
+      // 带 Cloudflare 边缘注入头（客户端伪造不了 cf-ray）。
+      headers: { host: `127.0.0.1:${proxy.port}`, accept: 'text/html', 'cf-ray': '8a1b2c3d4e5f6a7b-SJC', 'cf-connecting-ip': '203.0.113.9' },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+  const proxyGet = (path, headers) => new Promise((resolve, reject) => {
+    const req = httpRequest({ host: '127.0.0.1', port: proxy.port, path, headers }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+  try {
+    const noToken = await cfGet('/');
+    assert.equal(noToken.status, 200, '未认证返回登录页 200');
+    assert.match(noToken.body, /登录|password|访问密码/i, '必须要求公网密码');
+    assert.equal(seen.length, 0, '未认证的隧道请求不能到达上游');
+
+    const wrongPin = await cfGet(`/?token=LANPIN12`);
+    assert.equal(seen.length, 0, '局域网 PIN 不能登公网入口');
+
+    const okPin = await cfGet(`/?token=${PIN}`);
+    assert.equal(okPin.status, 200);
+    assert.deepEqual(seen, ['/'], '公网 PIN 通过，且 PIN 已从请求行摘掉');
+
+    // 本地反代（nginx 的 proxy_set_header Host $proxy_host）把 Host 改成 loopback、
+    // 只注入 X-Forwarded-For：同样必须按公网处理。
+    seen.length = 0;
+    const viaProxy = await proxyGet('/', {
+      host: `127.0.0.1:${proxy.port}`, accept: 'text/html', 'x-forwarded-for': '198.51.100.7',
+    });
+    assert.equal(viaProxy.status, 200);
+    assert.match(viaProxy.body, /登录|password|访问密码/i, '反代流量也要密码');
+    assert.equal(seen.length, 0, '反代的未认证请求同样不能到上游');
+    const viaProxyOk = await proxyGet(`/?token=${PIN}`, {
+      host: `127.0.0.1:${proxy.port}`, accept: 'text/html', 'x-forwarded-for': '198.51.100.7',
+    });
+    assert.equal(viaProxyOk.status, 200);
+    assert.deepEqual(seen, ['/'], '反代流量用公网 PIN 可登录');
   } finally {
     await proxy.close();
     await new Promise((r) => up.close(r));

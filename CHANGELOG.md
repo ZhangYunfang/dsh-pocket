@@ -1,3 +1,24 @@
+## [3.0.5](https://github.com/daha1216/dsh-pocket/compare/v3.0.4...v3.0.5) (2026-10-27)
+
+> 第二轮/第三轮对抗审查（认证隐私、settings 生命周期、客户端/移动端三路只读审计）后的补丁，完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。
+
+### Security
+
+* **proxy:** `?TOKEN=` 大写、`?token=<PIN>;foo=1` 这类变体现在同样能认证、同样在转发前剥离；地址栏清理脚本按键名小写匹配，同名参数只摘 PIN、不误删 dsh 启动 token
+* **proxy:** 源为 loopback 且带 `cf-ray`/`cf-connecting-ip`/`X-Forwarded-For`/`X-Real-IP`/`Forwarded` 的请求强制按公网判定——命名隧道或本地反代把 Host 改写成 `127.0.0.1` 不再能把公网入口降级成免密本机
+* **proxy:** `classifyHost`/`isLoopbackHost` 共用同一套归一化（`127.evil.com`、`127.0.0.1.`、IPv6 字面量不再误判）；全局锁期间错误猜测要消耗比较预算，分布式穷举失去无限比对
+* **rpc:** 公网来源禁止 `update`/`restart`（会拉 npm 包并重启宿主），设置页更新横幅在公网来源下不渲染；回退 `rpc.handle` 通道对无请求上下文的宿主显式告警降级原因
+* **settings:** 恢复出厂改为持锁 + 白名单删除（不再误删 `settings.json.mybackup` 或别人持有的 `.lock`）；stale 锁删不掉时不再无限忙等；主文件损坏/丢失时回退读 `.bak`
+* **tunnel:** Homebrew bottle 拿不到 Homebrew digest 时不再回退 GitHub digest（两份构建哈希不同，会把正品误报「投毒」）；bottle 版本按数字段比较
+
+### Bug Fixes
+
+* **settings:** 锁等待从 2s 降到 750ms，减少设置写入阻塞主线程
+* **service:** 字符串形式的 `hostPid` 也能被孤儿清扫识别，不再误杀共用 `$DSH_HOME` 的活实例
+* **index:** PIN 文件被删后会重新生成（不再被缓存永久挡住）；`inferProfile` 锚定到插件安装路径，避免 `DSH_HOME` 路径含 `profiles` 时更新错目标
+* **mobile:** 焦点陷阱过滤隐藏/inert 弹层并取最上层，弹层替换时 pop 旧 opener；文件复制按钮与链接按 id 清理失配项
+* **client:** 公网来源不显示更新/重启按钮；LAN PIN 读取失败与「公网不显示」分开提示；bridge 500 文案不再带内部错误细节
+
 ## [3.0.4](https://github.com/daha1216/dsh-pocket/compare/v3.0.3...v3.0.4) (2026-10-27)
 
 > 完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。

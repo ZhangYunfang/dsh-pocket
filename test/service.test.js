@@ -980,6 +980,35 @@ test('tsinghuaBottleUrl：按平台/架构匹配清华 bottle（Windows 无匹�
   }
 });
 
+test('tsinghuaBottleUrl：版本号按数字段比较（2025.10.0 不能输给 2025.9.1）', async () => {
+  const { tsinghuaBottleUrl } = await import('../lib/tunnel.mjs');
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    text: async () => `
+      <a href="cloudflared-2025.9.1.arm64_sonoma.bottle.tar.gz">
+      <a href="cloudflared-2025.10.0.arm64_sonoma.bottle.tar.gz">
+    `,
+  });
+  try {
+    const bottle = await tsinghuaBottleUrl({ os: 'darwin', a: 'arm64' });
+    assert.ok(bottle.url.includes('2025.10.0'), `必须按数字段选最新版本，实际: ${bottle.url}`);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('expectedDigestFor：Homebrew bottle 永不拿 GitHub 的 digest 校验（正品不能被误判投毒）', async () => {
+  const { expectedDigestFor } = await import('../lib/tunnel.mjs');
+  const official = 'a'.repeat(64);
+  const homebrew = { verifyDigest: true, digestSource: 'homebrew', expectedDigest: null };
+  assert.equal(expectedDigestFor(homebrew, official), null,
+    'bottle 源拿不到 Homebrew digest 时只能只做尺寸校验，回退 GitHub digest 会误杀正品');
+  assert.equal(expectedDigestFor({ ...homebrew, expectedDigest: 'b'.repeat(64) }, official), 'b'.repeat(64));
+  assert.equal(expectedDigestFor({ verifyDigest: true }, official), official, 'GitHub 资产/镜像用官方 digest');
+});
+
 test('桌面端（desktop=true）：update/restart 关闭，status 带标志，正常功能不受影响', async () => {
   const internals = stubInternals();
   const service = createPocketService({ dshPort: 3080, port: 3081, internals, getTunnelConfig: namedTunnelConfig });
@@ -1148,6 +1177,11 @@ test('孤儿清扫：marker 属于仍存活的另一个实例时绝不杀它的�
     writeFileSync(statePath, JSON.stringify({ at: Date.now(), mode: 'named', pid: 4242, hostPid: 8888 }));
     await service.restoreTunnelIfNeeded();
     assert.deepEqual(killed, [4242], '宿主已死的 marker 才允许清扫');
+
+    // hostPid 被写成字符串（旧版本/手工编辑）：必须仍被识别成活宿主，不能误杀
+    writeFileSync(statePath, JSON.stringify({ at: Date.now(), mode: 'named', pid: 4242, hostPid: '7777' }));
+    await service.restoreTunnelIfNeeded();
+    assert.deepEqual(killed, [4242], '字符串形式的 hostPid 也要过存活守卫');
   } finally {
     await service.dispose();
     rmSync(home, { recursive: true, force: true });
@@ -1303,6 +1337,9 @@ test('RPC：局域网密码独立于公网；lanTokenRefresh 刷新并返回新�
     [POCKET_ENDPOINTS.tunnelStart, { disclaimer: true }],
     [POCKET_ENDPOINTS.tunnelStop, {}],
     [POCKET_ENDPOINTS.tunnelSetConfig, { mode: 'named', hostname: 'evil.example.com' }],
+    // 更新会拉 npm 包并重启宿主：公网访客点一下就能打断服务/换掉供应链，必须同样拒绝
+    [POCKET_ENDPOINTS.update, {}],
+    [POCKET_ENDPOINTS.restart, {}],
   ]) {
     const r = await conn.handler(endpoint, payload, undefined, 'public');
     assert.equal(r.ok, false, `公网来源必须拒绝 ${endpoint}`);
@@ -1313,6 +1350,31 @@ test('RPC：局域网密码独立于公网；lanTokenRefresh 刷新并返回新�
   // 局域网来源改自己的密码仍然允许（它本来就是局域网的主人）。
   const lanOwn = await conn.handler(POCKET_ENDPOINTS.pinSetCustom, { which: 'lan', value: '33333333' }, undefined, 'lan');
   assert.equal(lanOwn.ok, true, '局域网来源可以改局域网密码');
+
+  await service.dispose();
+});
+
+test('RPC 回退路径：宿主缺 webServer.register 时按本机来源降级并告警（已知限制）', async () => {
+  // 场景：0.1.5 之前的宿主没有 webServer，只能走 connection.rpc.handle；这条路没有
+  // HTTP 请求上下文，拿不到代理写的 x-dsh-pocket-origin，只能按 loopback 处理——
+  // 与 README「PIN 持有者等同本机操作者」一致，但要在日志里告警，方便确认降级原因。
+  const service = createPocketService({ dshPort: 3080, port: 3081, internals: stubInternals(), getTunnelConfig: namedTunnelConfig });
+  const warnLines = [];
+  const withProxy = fakeCtxConnection();
+  const ctxWithProxy = { connection: withProxy, service, webServer: { port: 3080 } }; // 有 webServer 但无 register
+  installPocketRpc(ctxWithProxy, { service, getToken: () => 'PUBPIN99', getLanToken: () => 'LANPIN99', log: { error() {}, warn: (m) => warnLines.push(String(m)) } });
+  const s = await withProxy.handler(POCKET_ENDPOINTS.status, {});
+  assert.equal(s.value.origin, 'loopback', '回退路径没有请求上下文，只能按本机来源');
+  assert.ok(warnLines.some((l) => l.includes('webServer.register')), '必须告警说明降级原因');
+
+  // 对照：完全没有 webServer（headless/测试 fixture）也是本机来源，但不该刷告警
+  const headless = fakeCtxConnection();
+  const quiet = [];
+  installPocketRpc({ connection: headless, service }, { service, getToken: () => 'PUBPIN99', getLanToken: () => 'LANPIN99', log: { error() {}, warn: (m) => quiet.push(String(m)) } });
+  const local = await headless.handler(POCKET_ENDPOINTS.status, {});
+  assert.equal(local.value.origin, 'loopback');
+  assert.equal(local.value.accessToken, 'PUBPIN99', '本机仍能读到公网 PIN');
+  assert.equal(quiet.some((l) => l.includes('webServer.register')), false, '没有 webServer 时不该告警');
 
   await service.dispose();
 });

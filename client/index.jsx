@@ -1038,7 +1038,9 @@ function PocketSettingsTab({ rpcCall, t }) {
     }) : null,
 
     // 更新提示——琥珀色提示条（有新版本/更新中/已更新待重启，单状态不并存；桌面端不渲染）
-    !isDesktop && updateInfo ? Alert({ kind: 'warn', icon: Ico.download,
+    // 公网访客不渲染：服务端已拒绝公网走 update/restart（forbidden），露出按钮只会
+    // 让用户点了报错；更新/重启属于本机能力。
+    !isDesktop && !publicView && updateInfo ? Alert({ kind: 'warn', icon: Ico.download,
       title: updateInfo.updated
         ? fmt(t, 'updatedRestart', { ver: updateInfo.current })
         : updateInfo.result === 'ok'
@@ -1103,7 +1105,8 @@ function PocketSettingsTab({ rpcCall, t }) {
                       status.lanPinCustom ? h('div', { className: 'dshp-warn-text' }, t('pinCustomHint')) : null)
                     // 公网访问时后端故意不返回局域网 PIN（防止隧道访客拿到后
                     // 在同一 WiFi 下直连、绕过「关掉隧道」这种撤销手段）。
-                    : h('div', { className: 'dshp-hint' }, t('lanPinRemoteHint'))),
+                    // 本机/局域网拿不到则是读取失败，不要误报成「远端不显示」。
+                    : h('div', { className: 'dshp-hint' }, publicView ? t('lanPinRemoteHint') : t('lanPinUnavailable'))),
               Row({
                 label: t('advAddress'),
                 control: Btn({ variant: 'ghost', mini: true, onClick: () => setAdvOpen((v) => !v) }, (status.lanIpOverride || t('lanAddressAuto')) + (advOpen ? ' ‹' : ' ›')),

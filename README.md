@@ -110,7 +110,7 @@ npx @deepseek-ai/dsh web
 
 **升级兼容**：旧 Quick Tunnel 的开启/恢复标记不会恢复随机隧道；未配置时公网保持关闭。旧 Named Tunnel 的完整固定域名与 Token 配置可以继续使用；只有此前已开启、保留恢复标记且配置完整的命名隧道会在 DSH 重启后自动恢复。恢复出厂设置会关闭公网并清除域名、Token 和恢复标记，重新配置前不会开启。
 
-> 更新到新版本：重新执行上面的 `add` 命令即可（GitHub 地址不带 tag，装到的是默认分支最新提交）。想锁版本就写成 `github:daha1216/dsh-pocket#v3.0.4`，之后更新时把 tag 换成新版本号再 `add` 一次。
+> 更新到新版本：重新执行上面的 `add` 命令即可（GitHub 地址不带 tag，装到的是默认分支最新提交）。想锁版本就写成 `github:daha1216/dsh-pocket#v3.0.5`，之后更新时把 tag 换成新版本号再 `add` 一次。
 
 ### CLI 公网访问
 
@@ -131,7 +131,8 @@ Cloudflare 域名路由的 **Service 必须指向 CLI 的实际监听端口**（
 - **分享链接里的 `?token=` 不会留在日志里**：代理认证通过后会从上游请求行 / Referer / 访问日志里抹掉密码，并在首个 HTML 响应里用 `history.replaceState` 清掉手机地址栏的 query（分享链接照常能登，但不会把密码带进收藏和历史）
 - 公网地址由你自己的 Cloudflare 固定域名和命名隧道路由决定，**重启不会换地址**；固定域名更易被长期扫描，请妥善保管 Tunnel Token 和访问密码，用完即关
 - **公网判定是 fail closed**（issue #66）：除本机（loopback）和局域网私网地址外，**一切陌生域名（包括你自建隧道/反向代理指向本机端口的固定域名）一律按公网处理、强制公网密码**——不存在「换域名绕过密码」的口子
-- **命名隧道的 Public Hostname 不要设置 HTTP Host Header**：如果你把 Cloudflare 路由的「HTTP Host Header」改成 `127.0.0.1:3081`，cloudflared 会把公网请求伪装成本机回环，代理就分不清公网与本机，公网入口可能不再要求密码。保持默认（转发域名本身）即可；若你确实需要改，请同时把代理的端口与 ingress 对齐并确认公网仍要求密码
+- **命名隧道的 Public Hostname 不建议设置 HTTP Host Header**：如果你把 Cloudflare 路由的「HTTP Host Header」改成 `127.0.0.1:3081`，cloudflared 会把公网请求伪装成本机回环。代理现在会把「源是本机 + 带 `cf-ray`/`cf-connecting-ip`」的流量强制按公网处理，所以单靠改 Host Header 已不能绕过密码；但若你在这条链路前再套一层本地反代（`ssh -R`/`socat`/`netsh portproxy` 等）且它既不保留任何转发头、也不做认证，代理无法区分来源，请自行在反代层要求认证
+- **自建反向代理（nginx/traefik/Caddy）指向 3081 时**：请让反代保留 `X-Forwarded-For` / `X-Real-IP` / `Forwarded` 任一请求头——代理看到「本机来源 + 转发头」会强制按公网要求密码；`ssh -R`/`socat` 这类不注入头的纯端口转发会让流量看起来是纯本机，请只在可信网络里用，或在转发层自己加认证
 - 局域网模式不暴露公网，只有同一网络内的设备能访问
 - 适合个人自用；插件公网密码存本机 `$DSH_HOME/dsh-pocket/token`（不随启停或重启自动换新），局域网密码存 `$DSH_HOME/dsh-pocket/token-lan`（设置页手动刷新），开关、自定义标记及公网配置存 `$DSH_HOME/dsh-pocket/settings.json`
 - **CLI 模式（命令行直跑 `dsh-pocket`）也有密码**（issue #90 修复前这条路是无认证的）：默认随机生成 8 位密码，打印在终端、并已内嵌进二维码（**扫码体验不变**），手动敲地址时需要填写，本机访问免密。`--pin <值>` 或 `DSH_POCKET_PIN=<值>` 自定义（至少 8 位，前后空白会被去掉）；`--no-auth` 可关闭，**不推荐**——那等于把能执行代码的 DSH 裸暴露给任何能连上该端口的人；`--public` 与 `--no-auth` **不能同时使用**（否则固定域名会变成无密码的公网入口，CLI 会拒绝启动）
@@ -218,7 +219,7 @@ Cloudflare 域名路由的 **Service 必须指向 CLI 的实际监听端口**（
 ```sh
 npm install
 node client/build.mjs   # 改 client/ 后重新打包
-npm test                # 代理 / 认证 / 压缩 / 隧道 / 服务 / RPC / 设置（286 测试）
+npm test                # 代理 / 认证 / 压缩 / 隧道 / 服务 / RPC / 设置（294 测试）
 ```
 
 **改完想在本机先试？** 不用发版：把插件换成指向本地仓库的软链，重启 dsh web 就是本地代码。完整步骤（含怎么换回 npm 官方版本）见 [LOCAL-DEV.md](./LOCAL-DEV.md)。

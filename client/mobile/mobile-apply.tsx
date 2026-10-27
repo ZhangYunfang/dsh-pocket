@@ -609,6 +609,15 @@ export function mobileApply(ctx: ClientContext): void {
     const focusables = (node: Element): HTMLElement[] =>
       Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE))
         .filter((el) => el.getClientRects().length > 0)
+    // 只看「真的可见且在栈顶」的弹层：上游可能用 aria-hidden/inert/display:none 隐藏
+    // 旧弹层而不卸载，直接取第一个会把焦点陷阱迁到隐藏节点上（Tab 完全失效）。
+    const isShown = (el: Element): boolean =>
+      !el.closest('[aria-hidden="true"], [inert]') && el.getClientRects().length > 0
+    const topDialog = (): HTMLElement | null => {
+      const list = Array.from(document.querySelectorAll<HTMLElement>(DIALOG))
+        .filter((el) => isOurs(el) && isShown(el))
+      return list.length > 0 ? list[list.length - 1] : null
+    }
     let active: HTMLElement | null = null
 
     const onKeyDown = (event: KeyboardEvent): void => {
@@ -637,7 +646,7 @@ export function mobileApply(ctx: ClientContext): void {
     // 弹层出现/消失都从 DOM 突变看：上游用 innerHTML + append 建卡片，没有可挂的
     // 生命周期回调。只在真正换了弹层对象时才动焦点，避免每次突变都抢焦点。
     const sync = (): void => {
-      const dialog = Array.from(document.querySelectorAll<HTMLElement>(DIALOG)).find(isOurs) ?? null
+      const dialog = topDialog()
       if (dialog === active) return
       if (active !== null && dialog !== null) {
         // 弹层被**替换**（菜单 → 删除确认 / 错误卡）：这不是关闭，不能把焦点
@@ -645,6 +654,9 @@ export function mobileApply(ctx: ClientContext): void {
         // 旧实现走 close 分支后 active=null 且 return，新弹层要等下一次 DOM
         // 突变才会重新拿到焦点；上游用 innerHTML 重建卡片时可能很久没有下一次
         // 突变，期间 Tab 可以穿回背景列表，"模态"短暂失效（审计 F1）。
+        // 旧弹层的 opener 与替换后的弹层无关，丢弃它，否则新弹层关闭时焦点
+        // 会被甩回上一个弹层的触发按钮（审计 F5）。
+        triggerStack.pop()
         active = dialog
         if (!dialog.hasAttribute('tabindex')) dialog.setAttribute('tabindex', '-1')
         const list = focusables(dialog)
