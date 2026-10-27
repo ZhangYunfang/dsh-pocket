@@ -1,4 +1,4 @@
-## [Unreleased]（2026-10-27 全面审计）
+## [3.0.4](https://github.com/daha1216/dsh-pocket/compare/v3.0.3...v3.0.4) (2026-10-27)
 
 > 完整记录见 [docs/security-audit-2026-10-27.md](./docs/security-audit-2026-10-27.md)。
 
