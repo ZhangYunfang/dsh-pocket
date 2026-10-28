@@ -1,3 +1,20 @@
+## [3.1.1](https://github.com/ZhangYunfang/dsh-pocket) (2026-10-28)
+
+> **DSH 0.1.2-alpha.2 实测通过版**。本版无功能改动，只补验证结论与文档。
+
+### Verified
+
+* **compat:** 在国家 DSH `0.1.2-alpha.2` 上实测通过——宿主契约探针 7/7（真实 cordis Context + 真实 `@deepseek-ai/dsh-host-webserver`：代理监听、RPC 前缀路由、会话删除 exact 路由、端到端转发 + polyfill 注入、默认通道 quick 全部为真）
+* **compat:** 真机实测**局域网访问与公网隧道两条链路均可用**；DSH 重启后公网隧道自动恢复（`dsh-pocket: public tunnel auto-restored`）
+
+### Added
+
+* **tooling:** `scripts/probe-host.mjs` —— 宿主契约探针，只读、不碰现网进程与主力 `~/.dsh`；换 DSH 版本先跑它比看报错快
+
+### Docs
+
+* `docs/DSH-0.1.2-适配计划.md` 追加 §9 实测记录：探针原始输出、真机运行判据、版本兼容矩阵、以及两个「非插件原因」的排查结论（旧安装实际不在 profile 里 / `qrcode-terminal` 只被 CLI 使用）
+
 ## [3.1.0](https://github.com/ZhangYunfang/dsh-pocket) (2026-10-28)
 
 > **融合版首版**：以 [daha1216/dsh-pocket](https://github.com/daha1216/dsh-pocket) 3.0.3 为基线，

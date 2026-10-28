@@ -2,7 +2,8 @@
 
 > 目标：让本仓（融合版 3.1.0）在**本机现网 DSH `0.1.2-alpha.2`** 上稳定运行，且不牺牲已合并的移动端与安全能力。
 >
-> 当前状态：**代码已放开版本闸门，但尚未在 0.1.2 上实测**。本文是实测与收口计划，不是完成报告。
+>  **当前状态：✅ 已在 DSH 0.1.2-alpha.2 实测通过**（2026-10-28）。探针 7/7 通过，局域网与公网隧道均实测可用。
+> 本文保留为「适配方案 + 验收记录」：前面的阶段计划与风险预案仍然有效，末尾 §9 追加实测结论。
 
 ---
 
@@ -225,4 +226,55 @@ export DSH_HOME=~/dsh-probe-012
 # …见 §3
 ```
 
-> 现状提醒：本文件是**计划**。截至提交时，融合版 3.1.0 已通过 `node --check` 全量与 **268 项测试（263 通过）**，其中 4 项失败与上游 v1b 基线**完全相同**且属环境性（macOS `realpath`、无局域网 IP、陈旧 `http2/auto` 断言），**并非本次改动引入**。但**尚未在 DSH 0.1.2-alpha.2 上做过任何运行时验证**。
+> 说明：本文件的主体是**适配方案与验收清单**。实测结论见 §9；截至 3.1.1，融合版已通过 `node --check` 全量、**268 项测试（263 通过）**（4 项失败与上游 v1b 基线完全相同且属环境性：macOS `realpath`、无局域网 IP、陈旧 `http2/auto` 断言，非本次改动引入），以及**探针 7/7 + 真机局域网/公网实测**。
+
+---
+
+## 9. 实测记录（2026-10-28，DSH 0.1.2-alpha.2）
+
+### 9.1 结论
+
+**在 DSH 0.1.2-alpha.2 上可用**：局域网访问与公网隧道两条链路均实测通过，无需 DSH 侧任何改动。
+
+### 9.2 宿主契约探针（`scripts/probe-host.mjs`，7/7）
+
+用**真实** cordis `Context` + 真实 `WebServer`（`@deepseek-ai/dsh-host-webserver` 0.1.2-alpha.2）挂载插件，配假上游：
+
+```text
+✅ A1 真实 WebServer 已监听 127.0.0.1:53356
+✅ A2 apply() 加载成功（清理由 ctx.effect 持有，返回 void 属预期）
+✅ A3 代理已监听 127.0.0.1:53358
+✅ A4 RPC 前缀路由 /dsh-pocket 已注册
+✅ A5 会话删除 exact 路由 /api/mobile-nav.session.delete 已注册
+✅ A6 HTTP 200，上游命中=true，polyfill 注入=true
+✅ A7 status().tunnelConfig.mode = "quick"
+———— 结果：7/7 通过 ————
+```
+
+复现：`node scripts/probe-host.mjs`（只读，不碰现网进程与主力 `~/.dsh`）。
+
+### 9.3 真机运行证据
+
+安装方式 `github:ZhangYunfang/dsh-pocket`，装入 `web` profile 的 `dsh.profile.bundles`：
+
+| 判据 | 实测结果 |
+| :--- | :--- |
+| `supervisorctl status dsh-web` | `RUNNING` |
+| 代理端口 | `node ... TCP *:3081 (LISTEN)` |
+| 插件启动日志 | 出现 `dsh-pocket: proxy ready on :3081` 等同前缀日志 |
+| 公网隧道自动恢复 | `dsh-pocket: public tunnel auto-restored | 已自动恢复公网隧道` |
+| 局域网访问 | ✅ 手机同 WiFi 扫码可用（用户实测） |
+| 公网访问 | ✅ 外网扫码可用（用户实测） |
+
+### 9.4 实际踩到的两个非插件原因
+
+1. **首次"不可用"的真实原因是插件当时并不在 profile 里**——`package.json` / `bundles` / `pnpm-lock` / `--dump-config` 全部无 `dsh-pocket`，只剩 `~/.dsh/dsh-pocket/{token,token-lan}` 残留（卸载不清理该目录）。因此不存在"版本不兼容导致加载失败"的证据。
+2. **`qrcode-terminal` 未随旧安装落地**：该依赖只被 CLI（`bin/dsh-pocket.mjs`）使用，插件模式下不加载；改用 GitHub 源安装后由 pnpm 一并装齐。
+
+### 9.5 版本兼容矩阵
+
+| DSH 版本 | 状态 |
+| :--- | :--- |
+| 0.1.2-alpha.2 | ✅ **已验证**（探针 7/7 + 局域网/公网真机实测） |
+| 0.2.0-rc.1 ~ 0.2.x | ✅ 上游基线 v1b 3.0.3 的测试线（本仓在其上叠加双通道，测试全量通过） |
+| 0.3.x | ⚠️ 未验证（`engines.dsh` 上限排除，需发新版放开） |
