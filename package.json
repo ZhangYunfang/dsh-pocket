@@ -72,12 +72,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/daha1216/dsh-pocket.git"
+    "url": "git+https://github.com/ZhangYunfang/dsh-pocket.git"
   },
   "bugs": {
-    "url": "https://github.com/daha1216/dsh-pocket/issues"
+    "url": "https://github.com/ZhangYunfang/dsh-pocket/issues"
   },
-  "homepage": "https://github.com/daha1216/dsh-pocket",
+  "homepage": "https://github.com/ZhangYunfang/dsh-pocket",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
