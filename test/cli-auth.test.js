@@ -101,7 +101,7 @@ test('issue #90：密码要内嵌进入口 URL —— 加了认证不能让扫�
   assert.equal(entryUrl('http://192.168.1.20:3081', null), 'http://192.168.1.20:3081');
 });
 
-test('CLI 公网只接受已配置的固定域名，入口 URL 不依赖隧道输出', () => {
+test('CLI 公网：--public 用已配置固定域名，--quick 用随机地址，入口 URL 都取隧道输出', () => {
   const token = 'example-token-for-offline-tests';
   for (const config of [{ hostname: '', token }, { hostname: 'pocket.example.com', token: '' }]) {
     assert.throws(() => resolvePublicConfig(config), /固定域名.*Tunnel Token/);
@@ -110,8 +110,10 @@ test('CLI 公网只接受已配置的固定域名，入口 URL 不依赖隧道�
   assert.equal(config.url, 'https://pocket.example.com');
   assert.equal(entryUrl(config.url, '12345678'), 'https://pocket.example.com/?token=12345678');
   const src = readFileSync(cliPath, 'utf8');
-  assert.ok(src.includes('entryUrl(publicConfig.url, pin)'));
-  assert.ok(!src.includes('startQuickTunnel'));
+  // 融合版：named 用配置域名，quick 用隧道自己解析出的随机地址 —— 两处都必须进二维码。
+  assert.ok(src.includes('entryUrl(tunnel.url, pin)'), 'named/quick 统一用隧道对象上的 URL 拼入口');
+  assert.ok(src.includes('startQuickTunnel'), '--quick 走快速隧道');
+  assert.ok(src.includes('startNamedTunnel'), '--public 走命名隧道');
 });
 
 test('CLI --public 未配置时在监听端口或下载隧道程序前退出', async (t) => {

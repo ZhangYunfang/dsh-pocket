@@ -1,6 +1,6 @@
 {
   "name": "dsh-pocket",
-  "description": "把 DeepSeek Harness 装进你的口袋：一个包、一个设置页，手机扫码即同步访问电脑上的 DSH（局域网 + 公网，实时同屏）。",
+  "description": "把 DeepSeek Harness 装进你的口袋（融合版）：手机扫码同步操控电脑上的 DSH，局域网 + 公网双通道（快速隧道随机域名 / 自配 Cloudflare 固定域名），移动端抽屉布局。",
   "type": "module",
   "main": "lib/index.js",
   "bin": {
@@ -43,7 +43,7 @@
   },
   "engines": {
     "node": ">=22",
-    "dsh": "^0.2.0-rc.1"
+    "dsh": ">=0.1.2-alpha.2 <0.3.0"
   },
   "license": "GPL-2.0",
   "keywords": [
@@ -82,7 +82,7 @@
     "access": "public",
     "registry": "https://registry.npmjs.org/"
   },
-  "version": "3.0.3",
+  "version": "3.1.0",
   "allowScripts": {
     "esbuild@0.25.12": true
   }

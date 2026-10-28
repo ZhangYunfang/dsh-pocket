@@ -43,6 +43,10 @@ function stubInternals() {
       started.push(`named:${token}`);
       return { url: null, kill: () => {} };
     },
+    startQuickTunnel: async ({ port }) => {
+      started.push(`quick:${port}`);
+      return { url: `https://fake-${port}.trycloudflare.com`, kill: () => {} };
+    },
   };
 }
 
@@ -207,14 +211,10 @@ test('service：startProxy → 局域网状态（含二维码）；startTunnel �
   await service.dispose();
 });
 
+// 融合版：只有 named 配置不完整才拒绝；不带 mode / 非 named 一律按 quick（零配置）启动。
 for (const [label, cfg] of [
-  ['默认无配置', undefined],
-  ['配置返回 null', null],
-  ['配置为空对象', {}],
-  ['旧 quick 配置即使含 Token 与域名', namedTunnelConfig({ mode: 'quick' })],
-  ['缺少 mode', { token: FAKE_TUNNEL_TOKEN, hostname: 'pocket.example.com' }],
-  ['缺少 Token', { mode: 'named', hostname: 'pocket.example.com' }],
-  ['缺少域名', { mode: 'named', token: FAKE_TUNNEL_TOKEN }],
+  ['named 缺少 Token', { mode: 'named', hostname: 'pocket.example.com' }],
+  ['named 缺少域名', { mode: 'named', token: FAKE_TUNNEL_TOKEN }],
 ]) {
   test(`service：${label} 拒绝公网启动，不下载或拉起隧道`, () => withHome(async (home) => {
     const internals = stubInternals();
@@ -316,7 +316,7 @@ test('service：Named 进程异常退出清理公网状态，可再次开启', a
   }
 });
 
-test('RPC：保存 Named 仅落盘不启动，拒绝 quick；显式启动和 reset 均按配置生效', () => withHome(async () => {
+test('RPC：默认 quick 可直接开启；保存 Named 仅落盘不启动；显式启动和 reset 均按配置生效', () => withHome(async () => {
   const settings = await import('../lib/settings.mjs');
   const { resetPocketState } = await import('../lib/index.js');
   const internals = stubInternals();
@@ -333,11 +333,15 @@ test('RPC：保存 Named 仅落盘不启动，拒绝 quick；显式启动和 res
     log: { error() {}, warn() {} },
   });
   try {
-    const unconfigured = await conn.handler(POCKET_ENDPOINTS.tunnelStart, { disclaimer: true });
-    assert.equal(unconfigured.ok, false, '同意免责声明也不能绕过配置要求');
-    assert.equal(unconfigured.error.code, 'bad-request');
-    assert.match(unconfigured.error.message, /固定域名.*Tunnel Token/);
-    assert.deepEqual(internals.started, []);
+    // 融合版：默认 quick 通道零配置，勾了免责声明就能开
+    const quickStart = await conn.handler(POCKET_ENDPOINTS.tunnelStart, { disclaimer: true });
+    assert.equal(quickStart.ok, true, '默认 quick 通道无需任何 Cloudflare 配置');
+    assert.deepEqual(quickStart.value.tunnelConfig, { mode: 'quick', hostname: '', tokenSet: false });
+    assert.equal(quickStart.value.tunnelConfig.mode, 'quick');
+    assert.deepEqual(internals.started, ['quick:3081'], '走快速隧道并带上代理端口');
+    assert.match(String(quickStart.value.tunnelUrl), /trycloudflare\.com$/, 'quick 用随机域名');
+    service.stopTunnel();
+    internals.started.length = 0;
 
     const saved = await conn.handler(POCKET_ENDPOINTS.tunnelSetConfig, namedTunnelConfig());
     assert.equal(saved.ok, true);
@@ -349,7 +353,7 @@ test('RPC：保存 Named 仅落盘不启动，拒绝 quick；显式启动和 res
     const before = readFileSync(settings.settingsPath(), 'utf8');
 
     const quick = await conn.handler(POCKET_ENDPOINTS.tunnelSetConfig, namedTunnelConfig({ mode: 'quick', hostname: 'other.example.com', token: 'fake-replacement-token-for-tests' }));
-    assert.equal(quick.ok, false, 'RPC 不接受已移除的 quick 模式');
+    assert.equal(quick.ok, false, 'named 保存通道不接受 quick 模式（切模式走 setTunnelMode）');
     assert.equal(quick.error.code, 'bad-request');
     assert.equal(readFileSync(settings.settingsPath(), 'utf8'), before, '拒绝 quick 不改 Token 或域名');
     assert.deepEqual(internals.started, []);
@@ -368,12 +372,14 @@ test('RPC：保存 Named 仅落盘不启动，拒绝 quick；显式启动和 res
     const reset = await conn.handler(POCKET_ENDPOINTS.pocketReset, { confirm: true });
     assert.equal(reset.ok, true);
     assert.equal(reset.value.tunnelRunning, false, 'reset 先停止隧道');
-    assert.deepEqual(reset.value.tunnelConfig, { mode: 'named', hostname: '', tokenSet: false }, 'reset 回到未配置状态');
+    assert.deepEqual(reset.value.tunnelConfig, { mode: 'quick', hostname: '', tokenSet: false }, 'reset 回到未配置状态（默认 quick）');
     assert.equal(settings.tunnelAutoRestoreEnabled(), false, 'reset 关闭旧标记恢复资格');
+    // 融合版：reset 回到默认 quick，因此再次开启会走快速隧道（随机域名）
     const afterReset = await conn.handler(POCKET_ENDPOINTS.tunnelStart, { disclaimer: true });
-    assert.equal(afterReset.ok, false, 'reset 后不能回退到 Quick 启动');
-    assert.equal(afterReset.error.code, 'bad-request');
-    assert.deepEqual(internals.started, [`named:${FAKE_TUNNEL_TOKEN}`], 'reset 后未额外下载或启动');
+    assert.equal(afterReset.ok, true, 'reset 后回到默认 quick，零配置可再开启');
+    assert.equal(afterReset.value.tunnelConfig.mode, 'quick');
+    assert.deepEqual(internals.started, [`named:${FAKE_TUNNEL_TOKEN}`, 'quick:3081'], '仅新增一次快速隧道启动');
+    service.stopTunnel();
   } finally {
     await service.dispose();
   }
@@ -1035,18 +1041,18 @@ test('startProxy：端口被占（EADDRINUSE）时自动尝试下一个端口', 
   await service.dispose();
 });
 
+// 融合版恢复规则：marker 模式（无标记/quick 视为 quick）必须与当前模式一致，
+// 且 named 还需 Token+域名齐全；quick 只需标记一致（零配置）。
 for (const [label, mode, cfg, shouldRestore] of [
-  ['旧无 mode 标记 + 无配置', undefined, undefined, false],
-  ['旧无 mode 标记 + 旧 quick 配置', undefined, namedTunnelConfig({ mode: 'quick' }), false],
-  ['旧无 mode 标记 + Named 缺 Token', undefined, namedTunnelConfig({ token: '' }), false],
-  ['旧无 mode 标记 + Named 缺域名', undefined, namedTunnelConfig({ hostname: '' }), false],
-  ['旧无 mode 标记 + 禁止沿用恢复', undefined, namedTunnelConfig({ autoRestore: false }), false],
-  ['旧无 mode 标记 + 完整 Named 配置', undefined, namedTunnelConfig(), true],
-  ['旧无 mode 标记 + 显式允许 Named 恢复', undefined, namedTunnelConfig({ autoRestore: true }), true],
-  ['显式 quick 标记 + 完整 Named 配置', 'quick', namedTunnelConfig(), false],
-  ['显式 quick 标记 + 旧 quick 配置', 'quick', namedTunnelConfig({ mode: 'quick' }), false],
-  ['显式未知模式标记 + 完整 Named 配置', 'other', namedTunnelConfig(), false],
-  ['显式 Named 标记 + 无配置', 'named', undefined, false],
+  ['旧无 mode 标记 + 无配置（视为 quick）', undefined, undefined, true],
+  ['旧无 mode 标记 + 显式 quick 配置', undefined, namedTunnelConfig({ mode: 'quick' }), true],
+  ['旧无 mode 标记 + Named 缺 Token（模式不一致）', undefined, namedTunnelConfig({ token: '' }), false],
+  ['旧无 mode 标记 + Named 缺域名（模式不一致）', undefined, namedTunnelConfig({ hostname: '' }), false],
+  ['旧无 mode 标记 + 完整 Named 配置（模式不一致）', undefined, namedTunnelConfig(), false],
+  ['显式 quick 标记 + 完整 Named 配置（模式不一致）', 'quick', namedTunnelConfig(), false],
+  ['显式 quick 标记 + 显式 quick 配置', 'quick', namedTunnelConfig({ mode: 'quick' }), true],
+  ['显式未知模式标记 + 完整 Named 配置（按 quick 处理）', 'other', namedTunnelConfig(), false],
+  ['显式 Named 标记 + 无配置（模式不一致）', 'named', undefined, false],
   ['显式 Named 标记 + 缺 Token', 'named', namedTunnelConfig({ token: '' }), false],
   ['显式 Named 标记 + 缺域名', 'named', namedTunnelConfig({ hostname: '' }), false],
   ['显式 Named 标记 + 完整配置', 'named', namedTunnelConfig(), true],
@@ -1065,17 +1071,21 @@ for (const [label, mode, cfg, shouldRestore] of [
     try {
       await service.restoreTunnelIfNeeded();
       const status = await service.status();
+      // 恢复走哪条通道取决于 cfg.mode（缺省 quick）
+      const expectedMode = cfg?.mode === 'named' ? 'named' : 'quick';
+      const expectedStarted = expectedMode === 'named' ? [`named:${FAKE_TUNNEL_TOKEN}`] : ['quick:3081'];
+      const expectedUrl = expectedMode === 'named' ? 'https://pocket.example.com' : 'https://fake-3081.trycloudflare.com';
       assert.equal(status.tunnelRunning, shouldRestore);
-      assert.equal(status.tunnelUrl, shouldRestore ? 'https://pocket.example.com' : null);
-      assert.deepEqual(internals.started, shouldRestore ? [`named:${FAKE_TUNNEL_TOKEN}`] : [], '仅合格的 Named 配置允许下载和启动');
+      assert.equal(status.tunnelUrl, shouldRestore ? expectedUrl : null);
+      assert.deepEqual(internals.started, shouldRestore ? expectedStarted : [], '仅模式一致且配置合格才允许下载和启动');
       if (shouldRestore) {
         let marker;
         for (let i = 0; i < 50; i++) {
           try { marker = JSON.parse(readFileSync(statePath, 'utf8')); } catch { marker = null; }
-          if (marker?.mode === 'named' && marker.at > 1) break;
+          if (marker?.mode === expectedMode && marker.at > 1) break;
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
-        assert.equal(marker?.mode, 'named', '恢复后标记升级为显式 named');
+        assert.equal(marker?.mode, expectedMode, '恢复后标记写明当前通道');
         assert.ok(marker.at > 1, '恢复后重新写入当前开始时间');
         assert.equal(marker.token, undefined, '恢复标记不记录 Token');
       } else {

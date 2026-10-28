@@ -1,3 +1,35 @@
+## [3.1.0](https://github.com/ZhangYunfang/dsh-pocket) (2026-10-28)
+
+> **融合版首版**：以 [daha1216/dsh-pocket](https://github.com/daha1216/dsh-pocket) 3.0.3 为基线，
+> 回补 [shaobeichen/dsh-pocket](https://github.com/shaobeichen/dsh-pocket) 的 Quick Tunnel 一键公网能力，
+> 并放开 DSH 版本闸门。逐条对照与决策依据见 `MERGE.md`。
+
+### Features
+
+* **tunnel:** 恢复快速隧道（Quick Tunnel）——`lib/tunnel.mjs` 新增 `startQuickTunnel()` 与 `QUICK_TUNNEL_URL_RE`；零配置即可拿到随机 `*.trycloudflare.com` 公网地址，解决 3.0.0 起「没有 Cloudflare 账号就用不了公网」的问题
+* **settings:** `tunnelMode()` 默认回到 `quick`，支持 `quick`/`named` 双向切换；对「无存盘模式但已有完整命名配置」推断为 `named`，避免把已经在用的固定域名静默切成随机地址
+* **settings:** `setNamedTunnelConfig()` 收紧为 named-only，切模式统一走 `setTunnelMode()`，防止两条路径混淆后写入半份配置
+* **auth:** 公网密码轮换按通道区分——快速隧道每次开启换新（旧链接即时作废），固定域名不轮换（地址稳定）
+* **service:** 双通道自动恢复——重启后按 marker 记录的通道恢复，且要求「marker 模式与当前模式一致 + named 配置仍完整」
+* **cli:** 新增 `--quick`（零配置快速隧道）；`--public` 保持自配固定域名语义；两者都走 `entryUrl(tunnel.url, pin)` 进二维码
+* **client:** 设置页公网区块新增通道选择器（`.dshp-modes` / `.dshp-mode-opt`），开启前置条件按通道区分
+
+### Changed
+
+* **compat:** `engines.dsh` 从 `^0.2.0-rc.1` 放宽为 `>=0.1.2-alpha.2 <0.3.0`（上游闸门是防呆用，非代码只支持 0.2.x；依据见 `MERGE.md` §3.2）
+* **tunnel:** 快速隧道与命名隧道统一使用 `--protocol auto`（预检后自选 quic/http2，可绕开两个方向的端口封锁）
+
+### Docs
+
+* 新增 `MERGE.md`（融合决策与「A 独占 14 commit 在 B 中的覆盖情况」逐条对照）
+* 新增 `docs/DSH-0.1.2-适配计划.md`（宿主契约核验结论 + 五阶段适配计划 + 风险预案）
+* README 公网章节改写为双通道说明；安装命令指向本仓
+
+### Tests
+
+* 同步 v1b 把「quick 已移除」写死的 17 条契约用例到融合版语义（`settings` / `service` / `public-settings` / `cli-auth`）
+* 全量 268 项：**263 通过**；4 项失败与上游 v1b 基线**完全相同**且属环境性（macOS `realpath`、无局域网 IP、陈旧 `--protocol http2` 断言），非本次改动引入
+
 ## [3.0.3](https://github.com/daha1216/dsh-pocket/compare/v3.0.2...v3.0.3) (2026-10-27)
 
 > 3.0.0–3.0.2 是 named-only 安全加固线（关闭 semantic-release 的 npm 发布后未再生成条目），本版起恢复手写记录。

@@ -129,34 +129,55 @@ test('setCustomPin / rotateAccessToken（issue #33）：8–64 位字母数字�
 
 // ---------- 命名隧道配置（issue #66：固定公网域名） ----------
 
-test('隧道模式：默认 named 且未配置，拒绝 quick 和非法模式', () => withHome(async () => {
+test('隧道模式（融合版）：默认 quick，quick/named 双向可切，非法模式拒绝', () => withHome(async () => {
   const { tunnelMode, tunnelAutoRestoreEnabled, setTunnelMode, tunnelToken, tunnelHostname, settingsPath } = await import('../lib/settings.mjs');
-  assert.equal(tunnelMode(), 'named', '仅保留用户自配命名隧道');
+  assert.equal(tunnelMode(), 'quick', '默认走零配置的快速隧道');
   assert.equal(tunnelToken(), '', '默认未配置 Token');
   assert.equal(tunnelHostname(), '', '默认未配置域名');
   assert.equal(tunnelAutoRestoreEnabled(), false, '无存盘模式不能恢复旧标记');
   assert.equal(existsSync(settingsPath()), false, '读取默认值不创建配置');
-  assert.throws(() => setTunnelMode('quick'), /named/, 'quick 模式拒绝');
-  assert.equal(existsSync(settingsPath()), false, '拒绝 quick 不落盘');
+  assert.equal(setTunnelMode('quick'), 'quick', '可显式保存快速隧道模式');
+  assert.equal(tunnelMode(), 'quick', '快速模式持久化');
+  assert.equal(tunnelAutoRestoreEnabled(), true, '显式保存 quick 也允许恢复（issue #11）');
   assert.equal(setTunnelMode('named'), 'named', '可显式保存命名模式');
   assert.equal(tunnelMode(), 'named', '命名模式持久化');
   assert.equal(tunnelAutoRestoreEnabled(), true, '显式保存 named 才能沿用旧恢复意图');
   const before = readFileSync(settingsPath(), 'utf8');
-  for (const mode of ['quick', 'other', undefined, null]) {
-    assert.throws(() => setTunnelMode(mode), /named/, '非法模式拒绝');
+  for (const mode of ['other', 'QUICK', undefined, null, '']) {
+    assert.throws(() => setTunnelMode(mode), /未知的隧道模式/, '非法模式拒绝');
     assert.equal(readFileSync(settingsPath(), 'utf8'), before, '拒绝模式时配置不变');
   }
 }));
 
-for (const mode of [undefined, 'quick', 'other', 'named']) {
-  test(`隧道模式：旧存盘模式 ${String(mode)} 仅 named 允许沿用自动恢复`, () => withHome(async (home) => {
+test('隧道模式：无存盘模式但有完整命名配置时推断为 named（不把老 setup 切成随机域名）', () => withHome(async (home) => {
+  const { tunnelMode, settingsPath } = await import('../lib/settings.mjs');
+  mkdirSync(join(home, 'dsh-pocket'), { recursive: true });
+  writeFileSync(settingsPath(), JSON.stringify({ tunnelToken: 'fake-cloudflared-token-for-tests', tunnelHostname: 'pocket.example.com' }));
+  assert.equal(tunnelMode(), 'named', '完整命名配置 → named');
+}));
+
+test('隧道模式：无存盘模式且命名配置不完整时退回 quick', () => withHome(async (home) => {
+  // settings 有进程内缓存，同一 HOME 内连写会读到旧值，所以这条用独立 HOME。
+  const { tunnelMode, settingsPath } = await import('../lib/settings.mjs');
+  mkdirSync(join(home, 'dsh-pocket'), { recursive: true });
+  writeFileSync(settingsPath(), JSON.stringify({ tunnelToken: 'fake-cloudflared-token-for-tests' }));
+  assert.equal(tunnelMode(), 'quick', '只有 Token 没域名 → quick（配置不完整）');
+}));
+
+for (const [mode, expectMode, expectRestore, note] of [
+  [undefined, 'named', false, '无存盘模式但有完整命名配置 → 推断 named，恢复资格仍需显式保存'],
+  ['quick', 'quick', true, '显式 quick → 快速隧道，允许恢复'],
+  ['other', 'named', false, '未知模式 → 按完整命名配置推断 named，不授予恢复资格'],
+  ['named', 'named', true, '显式 named → 命名隧道，允许恢复'],
+]) {
+  test(`隧道模式：旧存盘模式 ${String(mode)} → ${expectMode}（${note}）`, () => withHome(async (home) => {
     const { tunnelMode, tunnelAutoRestoreEnabled, tunnelToken, tunnelHostname, settingsPath } = await import('../lib/settings.mjs');
     mkdirSync(join(home, 'dsh-pocket'), { recursive: true });
     const legacy = { tunnelMode: mode, tunnelToken: 'fake-cloudflared-token-for-tests', tunnelHostname: 'pocket.example.com' };
     writeFileSync(settingsPath(), JSON.stringify(legacy));
     const before = readFileSync(settingsPath(), 'utf8');
-    assert.equal(tunnelMode(), 'named', '旧模式对外统一为 named');
-    assert.equal(tunnelAutoRestoreEnabled(), mode === 'named', '恢复资格取决于原存盘模式');
+    assert.equal(tunnelMode(), expectMode, note);
+    assert.equal(tunnelAutoRestoreEnabled(), expectRestore, '恢复资格取决于原存盘模式');
     assert.equal(tunnelToken(), legacy.tunnelToken, '读取保留旧 Token');
     assert.equal(tunnelHostname(), legacy.tunnelHostname, '读取保留旧域名');
     assert.equal(readFileSync(settingsPath(), 'utf8'), before, '读取不会悄悄改写旧配置');
@@ -280,7 +301,7 @@ test('恢复出厂设置：清空全部设置 + 重设随机密码（开关回�
   assert.equal(settings.lanAuthEnabled(), true, '访问密码恢复默认开');
   assert.equal(settings.mobileRightbarEnabled(), true, '手机端右边栏恢复默认开');
   assert.equal(settings.lanIpOverride(), '', '局域网地址恢复自动');
-  assert.equal(settings.tunnelMode(), 'named', '重置后仍仅支持用户自配 Named');
+  assert.equal(settings.tunnelMode(), 'quick', '重置后回到默认的快速隧道通道');
   assert.equal(settings.tunnelAutoRestoreEnabled(), false, '重置后不能沿用旧自动恢复标记');
   assert.equal(settings.tunnelToken(), '', 'Tunnel Token 已清空');
   assert.equal(settings.tunnelHostname(), '', '固定域名已清空');

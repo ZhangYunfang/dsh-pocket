@@ -198,9 +198,18 @@ test('公网设置：恢复出厂回到未配置，不留下公网入口或二�
   assert.equal(switchOf(tree).props['aria-checked'], false);
 });
 
-test('源码与构建产物均不再携带随机域名功能', () => {
-  for (const relative of ['../client/index.jsx', '../client/client.js', '../client/pocket-locales.js', '../lib/tunnel.mjs', '../bin/dsh-pocket.mjs']) {
+test('融合版：源码与构建产物都重新携带快速隧道功能', () => {
+  // lib/tunnel.mjs + bin 必须导出/使用 startQuickTunnel；client 必须带模式选择器文案。
+  for (const relative of ['../lib/tunnel.mjs', '../bin/dsh-pocket.mjs']) {
     const source = readFileSync(new URL(relative, import.meta.url), 'utf8');
-    assert.doesNotMatch(source, /startQuickTunnel|QUICK_TUNNEL_URL_RE|modeQuick|modeNamed|switchToQuick|wanEphemeralWarn/, relative);
+    assert.match(source, /startQuickTunnel/, relative);
   }
+  assert.match(readFileSync(new URL('../lib/tunnel.mjs', import.meta.url), 'utf8'), /QUICK_TUNNEL_URL_RE/);
+  for (const relative of ['../client/index.jsx', '../client/client.js', '../client/pocket-locales.js']) {
+    const source = readFileSync(new URL(relative, import.meta.url), 'utf8');
+    assert.match(source, /modeQuick/, `${relative} 带快速隧道通道文案`);
+  }
+  // 打包产物必须跟着源码重建，不能停留在「仅 named」的旧 bundle
+  const bundle = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8');
+  assert.match(bundle, /dshp-mode-opt/, 'client.js 含通道选择器样式');
 });
